@@ -1,0 +1,43 @@
+[project]
+name = "song-agent"
+version = "0.2.0"
+description = "A multi-user Feishu planning, reminder, and document agent powered by GLM and Feishu MCP."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "apscheduler>=3.11,<4",
+  "fastapi>=0.116,<1",
+  "httpx>=0.28,<1",
+  "lark-oapi>=1.4.24,<2",
+  "mcp>=1.13,<2",
+  "pydantic-settings>=2.10,<3",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.4,<9",
+  "pytest-asyncio>=1.1,<2",
+  "ruff>=0.12,<1",
+]
+
+[project.scripts]
+song-agent = "song_agent.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["song_agent"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]

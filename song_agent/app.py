@@ -8,18 +8,29 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+import lark_oapi as lark
+from fastapi import FastAPI, Request, Response
+from lark_oapi.core.model import RawRequest
 
 from .config import Settings
 from .feishu.mcp import FeishuMcp
 from .feishu.oauth import FeishuOAuth
+from .feishu.openapi import FeishuOpenApi
 from .feishu.transport import FeishuTransport
 from .llm import StructuredLlm
+from .models import IncomingMessage
+from .observability.context import trace_scope
 from .planner import Planner
 from .scheduler import start_scheduler
-from .store import JsonStore
+from .services.audit import AuditService
+from .services.encryption import AesGcmTokenCipher
+from .services.outbox import ActionOutboxWorker
+from .services.pending_actions import PendingActionService
+from .services.reconciliation import ActionReconciliationService
+from .store import SqliteStore
 from .workflow import AgentWorkflow
 
 
@@ -38,36 +49,188 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         level=getattr(logging, config.log_level, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    store = JsonStore(config.data_file)
+    logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
+    logging.getLogger("apscheduler.scheduler").setLevel(logging.WARNING)
+    token_cipher = AesGcmTokenCipher.from_base64_keys(
+        config.token_encryption_keys,
+        config.song_agent_token_active_key_version,
+        bootstrap_secret=config.feishu_app_secret,
+        bootstrap_context=config.feishu_app_id,
+    )
+    if not config.token_encryption_keys:
+        logging.getLogger(__name__).warning(
+            "未配置 SONG_AGENT_TOKEN_KEY_V1；当前使用飞书 App Secret 派生的兼容密钥。"
+            "生产环境应配置独立的 Token 加密密钥。"
+        )
+    store = SqliteStore(
+        config.database_path,
+        app_id=config.feishu_app_id,
+        token_cipher=token_cipher,
+        legacy_json_path=config.data_file,
+        event_retention_days=config.processed_event_retention_days,
+    )
     oauth = FeishuOAuth(config, store)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await store.initialize()
+        recovered_runs = await store.recover_stale_agent_runs(
+            max_age_seconds=config.agent_run_timeout_seconds + 30
+        )
+        if recovered_runs:
+            logging.getLogger(__name__).warning(
+                "已将 %d 个超时未完成的 Agent run 标记为 interrupted",
+                recovered_runs,
+            )
         transport = FeishuTransport(config, store)
+        await transport.initialize()
         planner = Planner(StructuredLlm(config), config.timezone)
         mcp = FeishuMcp(config)
-        workflow = AgentWorkflow(planner, store, transport, oauth, mcp)
-        oauth.on_authorized = lambda chat_id: transport.send_markdown(
-            chat_id,
-            "✅ 你的飞书日历与云文档授权已完成。日程请再次回复“确认”；文档请重新发送要求。",
+        openapi = FeishuOpenApi(config)
+        pending_actions = PendingActionService(
+            store,
+            ttl_seconds=config.pending_action_ttl_seconds,
         )
+        audit = AuditService(store)
+        workflow = AgentWorkflow(
+            planner,
+            store,
+            transport,
+            oauth,
+            openapi,
+            mcp,
+            pending_actions,
+            audit,
+        )
+        reconciliation = ActionReconciliationService(store, audit)
+        outbox = ActionOutboxWorker(
+            store,
+            workflow.execute_pending_action,
+            reconciliation.reconcile,
+        )
+        workflow.notify_outbox = outbox.notify
+        
+        async def handle_oauth_authorized(chat_id: str, original_request: str) -> None:
+            """OAuth授权完成后的回调处理"""
+            if original_request:
+                # 有原始请求，自动继续处理
+                await transport.send_markdown(
+                    chat_id,
+                    "✅ 授权完成，正在继续处理你的请求...",
+                )
+                # 创建一个模拟的IncomingMessage来重新触发工作流
+                await workflow.enqueue(
+                    IncomingMessage(
+                        message_id=f"oauth_resume_{int(time.time())}",
+                        event_id=f"oauth_resume_{int(time.time())}",
+                        tenant_key="",
+                        app_id=config.feishu_app_id,
+                        user_id="",
+                        open_id="",
+                        tenant_user_id="",
+                        union_id="",
+                        chat_id=chat_id,
+                        thread_id="",
+                        root_id="",
+                        chat_type="p2p",
+                        message_type="text",
+                        text=original_request,
+                    )
+                )
+            else:
+                # 没有原始请求，提示用户重新发送
+                await transport.send_markdown(
+                    chat_id,
+                    "✅ 授权完成。请重新发送你的请求。",
+                )
+        
+        oauth.on_authorized = handle_oauth_authorized
         transport.start(asyncio.get_running_loop(), workflow.enqueue)
-        scheduler = start_scheduler(config, store, transport)
+        scheduler = await start_scheduler(config, store, transport)
+        outbox.start()
         app.state.store = store
         app.state.transport = transport
         app.state.oauth = oauth
         app.state.workflow = workflow
+        app.state.outbox = outbox
+        app.state.loop = asyncio.get_running_loop()
+        if not config.feishu_verification_token:
+            logging.getLogger(__name__).warning(
+                "FEISHU_VERIFICATION_TOKEN 未配置：敏感操作确认卡片暂不可执行"
+            )
         logging.getLogger(__name__).info("FastAPI 服务已启动: %s", config.base_url)
-        yield
-        scheduler.shutdown(wait=False)
+        try:
+            yield
+        finally:
+            scheduler.shutdown(wait=False)
+            await outbox.close()
+            await planner.llm.close()
+            await store.close()
 
-    app = FastAPI(title="Song Agent", version="0.2.0", lifespan=lifespan)
+    app = FastAPI(title="Song Agent", version="0.3.0", lifespan=lifespan)
     app.include_router(oauth.router)
+
+    @app.middleware("http")
+    async def trace_http_request(request: Request, call_next):
+        with trace_scope() as trace_id:
+            response = await call_next(request)
+            response.headers["X-Trace-ID"] = trace_id
+            return response
+
+    def process_card_action(card: lark.Card):
+        loop = getattr(app.state, "loop", None)
+        workflow = getattr(app.state, "workflow", None)
+        if loop is None or workflow is None:
+            raise RuntimeError("Song Agent 尚未完成启动")
+        future = asyncio.run_coroutine_threadsafe(workflow.handle_card_action(card), loop)
+        return future.result(timeout=5)
+
+    card_handler = (
+        lark.CardActionHandler.builder(
+            config.feishu_encrypt_key,
+            config.feishu_verification_token,
+        )
+        .register(process_card_action)
+        .build()
+    )
+
+    @app.post("/feishu/card/action")
+    async def card_action(request: Request) -> Response:
+        if not config.feishu_verification_token:
+            return Response(
+                content='{"msg":"card callback verification is not configured"}',
+                status_code=503,
+                media_type="application/json",
+            )
+        raw = RawRequest()
+        raw.uri = request.url.path
+        raw.headers = dict(request.headers)  # type: ignore[assignment]
+        raw.body = await request.body()
+
+        try:
+            result = await asyncio.to_thread(card_handler.do, raw)
+            return Response(
+                content=result.content,
+                status_code=result.status_code,
+                media_type="application/json",
+            )
+        except Exception:
+            logging.getLogger(__name__).exception("卡片回调处理失败")
+            return Response(
+                content='{"msg":"internal error"}',
+                status_code=500,
+                media_type="application/json",
+            )
 
     @app.get("/health")
     async def health() -> dict[str, bool]:
-        return {"ok": True}
+        return {
+            "ok": True,
+            "calendar_confirmation_ready": bool(config.feishu_verification_token),
+            "token_encryption_ready": True,
+            "outbox_recovery_ready": True,
+            "persistent_scheduler_ready": True,
+        }
 
     return app
 

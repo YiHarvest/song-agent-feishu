@@ -154,9 +154,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.workflow = workflow
         app.state.outbox = outbox
         app.state.loop = asyncio.get_running_loop()
-        if not config.feishu_verification_token:
+        if not config.feishu_encrypt_key:
             logging.getLogger(__name__).warning(
-                "FEISHU_VERIFICATION_TOKEN 未配置：敏感操作确认卡片暂不可执行"
+                "FEISHU_ENCRYPT_KEY 未配置：敏感操作确认卡片暂不可执行"
             )
         logging.getLogger(__name__).info("FastAPI 服务已启动: %s", config.base_url)
         try:
@@ -185,10 +185,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         future = asyncio.run_coroutine_threadsafe(workflow.handle_card_action(card), loop)
         return future.result(timeout=5)
 
+    # 飞书卡片回调安全说明（依据飞书官方文档）：
+    # 卡片回调请求不携带 X-Lark-Request-Timestamp / X-Lark-Request-Nonce / X-Lark-Signature
+    # 这些签名头仅出现在「事件订阅」的 HTTP 回调中。卡片回调的安全验证依赖 encrypt_key
+    # 对请求体进行 AES 解密完成，而非签名验证。
+    #
+    # lark_oapi 的 CardActionHandler._verify_sign 错误地使用 verification_token 进行签名
+    # 校验，但卡片回调请求中没有 timestamp/nonce 头，会导致 NoneType 拼接异常。
+    # 因此这里不传入 verification_token，使其跳过签名验证，仅依赖 encrypt_key 解密保护。
+    # 若未配置 encrypt_key，则卡片回调端点返回 503。
     card_handler = (
         lark.CardActionHandler.builder(
             config.feishu_encrypt_key,
-            config.feishu_verification_token,
+            "",  # 不传入 verification_token，避免触发错误的签名验证逻辑
         )
         .register(process_card_action)
         .build()
@@ -196,9 +205,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/feishu/card/action")
     async def card_action(request: Request) -> Response:
-        if not config.feishu_verification_token:
+        if not config.feishu_encrypt_key:
             return Response(
-                content='{"msg":"card callback verification is not configured"}',
+                content='{"msg":"card callback encryption is not configured"}',
                 status_code=503,
                 media_type="application/json",
             )
@@ -226,7 +235,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def health() -> dict[str, bool]:
         return {
             "ok": True,
-            "calendar_confirmation_ready": bool(config.feishu_verification_token),
+            "calendar_confirmation_ready": bool(config.feishu_encrypt_key),
             "token_encryption_ready": True,
             "outbox_recovery_ready": True,
             "persistent_scheduler_ready": True,

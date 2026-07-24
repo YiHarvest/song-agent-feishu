@@ -14,23 +14,14 @@ import re
 import shutil
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from dataclasses import dataclass
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from ..config import Settings
-from ..models import DailyRecord, PlanTask
-
-
-@dataclass
-class CalendarCreationResult:
-    created: list[tuple[str, str]] = field(default_factory=list)
-    failed: list[tuple[str, str]] = field(default_factory=list)
-    skipped: list[str] = field(default_factory=list)
+from ..models import UserTokenContext
 
 
 @dataclass
@@ -58,46 +49,11 @@ class FeishuMcp:
         self.settings = settings
         self.logger = logging.getLogger(__name__)
 
-    async def create_events(
-        self,
-        record: DailyRecord,
-        access_token: str,
-        task_ids: set[str] | None = None,
-    ) -> CalendarCreationResult:
-        output = CalendarCreationResult()
-        selected = [task for task in record.tasks if task_ids is None or task.id in task_ids]
-        candidates = [task for task in selected if task.start_time and not task.calendar_event_id]
-        output.skipped = [task.id for task in selected if not task.start_time]
-        if not candidates:
-            return output
-        async with self._session(
-            access_token, "preset.calendar.default,calendar.v4.calendarEvent.delete"
-        ) as session:
-            calendar_id = self.settings.feishu_calendar_id or await self._primary_calendar_id(session)
-            for task in candidates:
-                try:
-                    event_id = await self._create_event(session, calendar_id, record, task)
-                    output.created.append((task.id, event_id))
-                except Exception as error:
-                    output.failed.append((task.id, str(error)))
-                    self.logger.exception("通过 MCP 创建飞书日程失败: %s", task.id)
-        return output
-
-    async def delete_event(self, event_id: str, access_token: str) -> None:
-        async with self._session(
-            access_token, "preset.calendar.default,calendar.v4.calendarEvent.delete"
-        ) as session:
-            calendar_id = self.settings.feishu_calendar_id or await self._primary_calendar_id(session)
-            result = await self._call_tool(
-                session,
-                "calendar_v4_calendarEvent_delete",
-                {"path": {"calendar_id": calendar_id, "event_id": event_id}, "useUAT": True},
-            )
-            parse_mcp_result(result)
-
-    async def create_document(self, title: str, markdown: str, access_token: str) -> CreatedDocument:
+    async def create_document(
+        self, title: str, markdown: str, token_context: UserTokenContext
+    ) -> CreatedDocument:
         tools = "docx.v1.document.create,docx.v1.documentBlockChildren.create"
-        async with self._session(access_token, tools) as session:
+        async with self._session(token_context.access_token, tools) as session:
             created = await self._call_tool(
                 session,
                 "docx_v1_document_create",
@@ -127,9 +83,13 @@ class FeishuMcp:
             )
 
     async def search_documents(
-        self, search_key: str, access_token: str, *, chat_id: str | None = None
+        self,
+        search_key: str,
+        token_context: UserTokenContext,
+        *,
+        chat_id: str | None = None,
     ) -> list[FoundDocument]:
-        async with self._session(access_token, "docx.builtin.search") as session:
+        async with self._session(token_context.access_token, "docx.builtin.search") as session:
             data: dict[str, Any] = {"search_key": search_key, "count": 50}
             if chat_id:
                 data["chat_ids"] = [chat_id]
@@ -158,10 +118,14 @@ class FeishuMcp:
         return list(found.values())
 
     async def append_document(
-        self, document_id: str, title: str, markdown: str, access_token: str
+        self,
+        document_id: str,
+        title: str,
+        markdown: str,
+        token_context: UserTokenContext,
     ) -> CreatedDocument:
         tools = "docx.v1.documentBlockChildren.get,docx.v1.documentBlockChildren.create"
-        async with self._session(access_token, tools) as session:
+        async with self._session(token_context.access_token, tools) as session:
             index = 0
             page_token: str | None = None
             while True:
@@ -240,64 +204,8 @@ class FeishuMcp:
                     await session.initialize()
                     yield session
 
-    async def _primary_calendar_id(self, session: ClientSession) -> str:
-        result = await self._call_tool(session, "calendar_v4_calendar_primary", {"useUAT": True})
-        payload = parse_mcp_result(result)
-        calendar_id = find_string(payload, "calendar_id")
-        if not calendar_id:
-            raise RuntimeError("MCP 未返回用户主日历 ID")
-        return calendar_id
-
-    async def _create_event(
-        self, session: ClientSession, calendar_id: str, record: DailyRecord, task: PlanTask
-    ) -> str:
-        zone = ZoneInfo(self.settings.timezone)
-        start = datetime.fromisoformat(f"{record.date}T{task.start_time}").replace(tzinfo=zone)
-        end = (
-            datetime.fromisoformat(f"{record.date}T{task.end_time}").replace(tzinfo=zone)
-            if task.end_time
-            else start + timedelta(minutes=30)
-        )
-        if end <= start:
-            end += timedelta(days=1)
-
-        event_data: dict[str, Any] = {
-            "summary": f"[{task.id}] {task.title}",
-            "description": f"由个人管家根据 {record.date} 日计划创建；创建者仅为当前授权用户。",
-            "start_time": {
-                "timestamp": str(int(start.timestamp())),
-                "timezone": self.settings.timezone,
-            },
-            "end_time": {"timestamp": str(int(end.timestamp())), "timezone": self.settings.timezone},
-            "reminders": [{"minutes": 10}],
-            "vchat": {"vc_type": "no_meeting"},
-        }
-
-        # 添加周期性设置
-        if task.repeat == "daily":
-            event_data["repeat_interval"] = "FREQ=DAILY"
-        elif task.repeat == "weekdays":
-            event_data["repeat_interval"] = "FREQ=WEEKDAYS"
-        elif task.repeat == "weekly":
-            event_data["repeat_interval"] = "FREQ=WEEKLY"
-
-        result = await self._call_tool(
-            session,
-            "calendar_v4_calendarEvent_create",
-            {
-                "path": {"calendar_id": calendar_id},
-                "data": event_data,
-                "useUAT": True,
-            },
-        )
-        payload = parse_mcp_result(result)
-        event_id = find_string(payload, "event_id")
-        if not event_id:
-            raise RuntimeError("MCP 返回成功，但缺少 event_id")
-        return event_id
-
     async def _call_tool(self, session: ClientSession, name: str, arguments: dict[str, Any]) -> Any:
-        """Call an MCP tool with an auditable, secret-free terminal trace."""
+        """调用 MCP 工具，输出可审计、无敏感信息的终端追踪日志。"""
         safe_arguments = redact_sensitive(arguments)
         self.logger.info(
             "🔧 调用工具 name=%s arguments=%s",
@@ -330,7 +238,7 @@ def parse_mcp_result(result: Any) -> Any:
 
 
 def redact_sensitive(value: Any) -> Any:
-    """Redact credentials if future tool arguments ever contain them."""
+    """如果未来工具参数包含凭据，则进行脱敏处理。"""
     if isinstance(value, dict):
         return {
             key: (
@@ -378,7 +286,7 @@ def sanitize_title(title: str) -> str:
 
 
 def markdown_to_text_blocks(markdown: str, title: str) -> list[dict[str, Any]]:
-    """Convert Markdown to safe text blocks without requiring the audited Drive import scope."""
+    """将 Markdown 转换为安全的文本块，无需 Drive 导入权限范围。"""
     cleaned = markdown.replace("\r\n", "\n").replace("\r", "\n")
     paragraphs: list[str] = []
     for raw in re.split(r"\n\s*\n|\n", cleaned):

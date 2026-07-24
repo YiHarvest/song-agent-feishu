@@ -1,3 +1,9 @@
+from __future__ import annotations
+
+import asyncio
+import threading
+
+from song_agent.feishu import transport
 from song_agent.feishu.mcp import markdown_to_text_blocks
 from song_agent.feishu.transport import clean_incoming_text, parse_message_text
 
@@ -25,3 +31,23 @@ def test_markdown_becomes_safe_docx_text_blocks() -> None:
         "结果",
         "• 通过",
     ]
+
+
+def test_websocket_client_uses_thread_owned_event_loop() -> None:
+    captured: dict[str, asyncio.AbstractEventLoop] = {}
+
+    class StubWsClient:
+        def start(self) -> None:
+            captured["running"] = asyncio.get_event_loop()
+            captured["sdk"] = transport.lark_ws_client.loop
+
+    thread = threading.Thread(
+        target=transport._run_ws_client,
+        args=(StubWsClient(),),  # type: ignore[arg-type]
+    )
+    thread.start()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert captured["running"] is captured["sdk"]
+    assert captured["running"].is_closed()

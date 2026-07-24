@@ -2,6 +2,7 @@ from song_agent.feishu.transport import clean_incoming_text
 from song_agent.models import DailyRecord, ParsedPlanTask
 from song_agent.planner import (
     build_tasks,
+    detect_exact_intent,
     detect_intent_heuristically,
     format_plan,
     has_explicit_time_hint,
@@ -41,15 +42,27 @@ def test_confirmation_is_deliberately_narrow() -> None:
     assert not is_confirmation("我确认今天要做三件事")
 
 
-def test_intent_recognizes_reminders_documents_and_reviews() -> None:
-    assert detect_intent_heuristically("今天规划") == "plan"
-    assert detect_intent_heuristically("帮我设置今天 20:30 的测试闹钟") == "reminder"
-    assert detect_intent_heuristically("10分钟后提醒我交pr") == "reminder"
-    assert detect_intent_heuristically("十分钟后提醒我提交材料") == "reminder"
-    assert detect_intent_heuristically("创建一份飞书云文档，写群聊测试记录") == "document"
-    assert detect_intent_heuristically("在我的文档里追加吃饭两个字") == "document"
-    assert detect_intent_heuristically("写入群里的每日计划文档") == "document"
-    assert detect_intent_heuristically("我复盘一下，写方案完成了") == "review"
+def test_only_exact_commands_bypass_structured_llm_routing() -> None:
+    assert detect_intent_heuristically("/plan 今天写方案") == "plan"
+    assert detect_intent_heuristically("/remind 20:30 测试") == "reminder"
+    assert detect_intent_heuristically("/doc 创建测试记录") == "document"
+    assert detect_intent_heuristically("/review 写方案完成了") == "review"
+
+    # Natural language, including keyword-heavy text, must be classified by the LLM.
+    assert detect_intent_heuristically("今天规划") == "unknown"
+    assert detect_intent_heuristically("10分钟后提醒我交pr") == "unknown"
+    assert detect_intent_heuristically("创建一份飞书云文档") == "unknown"
+
+
+def test_negative_or_meta_language_never_hits_a_write_route_locally() -> None:
+    for text in (
+        "这个安排不合理，不要创建日程",
+        "别提醒我看电影",
+        "复盘功能现在有问题",
+        "他说让我创建一份文档，但先不要做",
+    ):
+        assert detect_exact_intent(text) is None
+        assert detect_intent_heuristically(text) == "unknown"
 
 
 def test_intent_recognizes_greetings_and_capability_questions_as_chat() -> None:
@@ -60,7 +73,7 @@ def test_intent_recognizes_greetings_and_capability_questions_as_chat() -> None:
 
 def test_plan_output_requires_confirmation_and_mentions_own_calendar() -> None:
     output = format_plan(make_record())
-    assert "回复" in output and "确认" in output
+    assert "确认卡片" in output
     assert "你自己的飞书日历" in output
     assert "10:00-11:30" in output
 

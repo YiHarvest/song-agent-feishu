@@ -7,11 +7,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 import time
+import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from datetime import UTC, datetime
 from urllib.parse import urlencode
 
 import httpx
@@ -19,15 +21,8 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse
 
 from ..config import Settings
-from ..models import OAuthToken
-from ..store import JsonStore
-
-
-@dataclass
-class PendingAuthorization:
-    user_id: str
-    chat_id: str
-    expires_at: int
+from ..models import FeishuIdentity, OAuthToken, UserTokenContext
+from ..store import SqliteStore
 
 
 class FeishuOAuth:
@@ -37,32 +32,54 @@ class FeishuOAuth:
     处理用户身份授权流程，包括创建授权链接、处理回调、令牌刷新等。
     """
 
-    def __init__(self, settings: Settings, store: JsonStore) -> None:
+    def __init__(self, settings: Settings, store: SqliteStore) -> None:
         self.settings = settings
         self.store = store
         self.logger = logging.getLogger(__name__)
-        self.pending: dict[str, PendingAuthorization] = {}
-        self.on_authorized: Callable[[str], Awaitable[None]] | None = None
+        self._refresh_locks: dict[str, asyncio.Lock] = {}
+        self._worker_id = f"oauth:{uuid.uuid4()}"
+        self.on_authorized: Callable[[str, str], Awaitable[None]] | None = None
         self.router = APIRouter()
         self.router.add_api_route("/oauth/callback", self.handle_callback, methods=["GET"])
 
-    def create_authorization_url(self, user_id: str, chat_id: str) -> str:
+    async def create_authorization_url(
+        self,
+        identity: FeishuIdentity,
+        chat_id: str,
+        required_scopes: tuple[str, ...] | None = None,
+        original_request: str = "",
+    ) -> str:
         state = secrets.token_urlsafe(32)
-        self.pending[state] = PendingAuthorization(user_id, chat_id, int(time.time()) + 600)
+        await self.store.save_oauth_authorization(
+            state,
+            identity,
+            chat_id,
+            int(time.time()) + 600,
+            original_request=original_request,
+        )
+        scopes = tuple(
+            dict.fromkeys(("offline_access", *(required_scopes or self.settings.required_oauth_scopes)))
+        )
         query = urlencode(
             {
                 "client_id": self.settings.feishu_app_id,
                 "redirect_uri": f"{self.settings.base_url}/oauth/callback",
-                "scope": " ".join(("offline_access", *self.settings.required_oauth_scopes)),
+                "scope": " ".join(scopes),
                 "state": state,
             }
         )
         return f"{self.settings.domain}/open-apis/authen/v1/authorize?{query}"
 
-    async def get_valid_access_token(
-        self, user_id: str, required_scopes: tuple[str, ...] | None = None
-    ) -> str | None:
-        token = self.store.get_token(user_id)
+    async def get_valid_token_context(
+        self,
+        identity: FeishuIdentity,
+        required_scopes: tuple[str, ...] | None = None,
+    ) -> UserTokenContext | None:
+        token = await self.store.get_token(
+            identity.subject_id,
+            tenant_key=identity.tenant_key,
+            app_id=identity.app_id,
+        )
         if not token:
             return None
         scopes = {item for item in token.scope.replace(",", " ").split() if item}
@@ -70,24 +87,86 @@ class FeishuOAuth:
             return None
         now = int(time.time() * 1000)
         if token.expires_at > now + 60_000:
-            return token.access_token
+            return self._context(token)
         if token.refresh_expires_at <= now + 60_000:
             return None
+        lock_key = ":".join((identity.tenant_key, identity.app_id, identity.subject_id))
+        lock = self._refresh_locks.setdefault(lock_key, asyncio.Lock())
         try:
-            payload = await self._exchange_token(
-                {"grant_type": "refresh_token", "refresh_token": token.refresh_token}
+            async with lock:
+                # Another request may have refreshed while this request was waiting.
+                token = await self.store.get_token(
+                    identity.subject_id,
+                    tenant_key=identity.tenant_key,
+                    app_id=identity.app_id,
+                )
+                if not token:
+                    return None
+                now = int(time.time() * 1000)
+                if token.expires_at > now + 60_000:
+                    return self._context(token)
+                lease_owner = f"{self._worker_id}:{uuid.uuid4()}"
+                claimed = await self.store.claim_token_refresh(
+                    identity.subject_id,
+                    tenant_key=identity.tenant_key,
+                    app_id=identity.app_id,
+                    owner_id=lease_owner,
+                )
+                if claimed is None:
+                    return await self._wait_for_concurrent_refresh(identity)
+                try:
+                    payload = await self._exchange_token(
+                        {
+                            "grant_type": "refresh_token",
+                            "refresh_token": claimed.refresh_token,
+                        }
+                    )
+                    next_token = self._stored_token(identity, payload)
+                    if not next_token.refresh_token:
+                        next_token.refresh_token = claimed.refresh_token
+                        next_token.refresh_expires_at = claimed.refresh_expires_at
+                    saved = await self.store.save_refreshed_token(
+                        next_token,
+                        owner_id=lease_owner,
+                    )
+                    if not saved:
+                        return await self._wait_for_concurrent_refresh(identity)
+                    return self._context(next_token)
+                except Exception:
+                    await self.store.fail_token_refresh(
+                        identity.subject_id,
+                        tenant_key=identity.tenant_key,
+                        app_id=identity.app_id,
+                        owner_id=lease_owner,
+                    )
+                    self.logger.exception("刷新飞书用户令牌失败")
+                    return None
+        finally:
+            if not lock.locked():
+                self._refresh_locks.pop(lock_key, None)
+
+    async def _wait_for_concurrent_refresh(
+        self,
+        identity: FeishuIdentity,
+    ) -> UserTokenContext | None:
+        for _ in range(50):
+            await asyncio.sleep(0.1)
+            token = await self.store.get_token(
+                identity.subject_id,
+                tenant_key=identity.tenant_key,
+                app_id=identity.app_id,
             )
-            next_token = self._stored_token(user_id, payload)
-            await self.store.save_token(next_token)
-            return next_token.access_token
-        except Exception:
-            self.logger.exception("刷新飞书用户令牌失败")
-            return None
+            if token and token.expires_at > int(time.time() * 1000) + 60_000:
+                return self._context(token)
+        return None
 
     async def handle_callback(self, code: str = "", state: str = "") -> HTMLResponse:
-        pending = self.pending.pop(state, None)
-        if not code or not pending or pending.expires_at < int(time.time()):
+        if not code or not state:
             raise HTTPException(400, "授权链接无效或已过期，请回到飞书重新发起授权。")
+        pending = await self.store.consume_oauth_authorization(state)
+        if not pending:
+            raise HTTPException(400, "授权链接无效或已过期，请回到飞书重新发起授权。")
+        identity, chat_id, original_request = pending
         try:
             payload = await self._exchange_token(
                 {
@@ -97,13 +176,13 @@ class FeishuOAuth:
                 }
             )
             actual_user = await self._current_user(payload["access_token"])
-            if actual_user != pending.user_id:
+            if actual_user.get("open_id") != identity.open_id:
                 raise RuntimeError("授权账号与消息发送者不一致")
-            await self.store.save_token(self._stored_token(pending.user_id, payload))
+            await self.store.save_token(self._stored_token(identity, payload, actual_user))
             if self.on_authorized:
-                await self.on_authorized(pending.chat_id)
+                await self.on_authorized(chat_id, original_request)
             # 授权成功后自动跳转回飞书聊天
-            feishu_link = f"https://applink.feishu.cn/client/chat/open?openChatId={pending.chat_id}"
+            feishu_link = f"https://applink.feishu.cn/client/chat/open?openChatId={chat_id}"
             return HTMLResponse(
                 f"""
 <!DOCTYPE html>
@@ -141,7 +220,7 @@ class FeishuOAuth:
             raise HTTPException(500, f"授权失败：{error}") from error
 
     async def _exchange_token(self, data: dict[str, str]) -> dict:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=20, trust_env=False) as client:
             response = await client.post(
                 f"{self.settings.domain}/open-apis/authen/v2/oauth/token",
                 json={
@@ -155,26 +234,54 @@ class FeishuOAuth:
             raise RuntimeError(payload.get("msg") or f"令牌接口返回 HTTP {response.status_code}")
         return payload
 
-    async def _current_user(self, access_token: str) -> str:
-        async with httpx.AsyncClient(timeout=20) as client:
+    async def _current_user(self, access_token: str) -> dict[str, str]:
+        async with httpx.AsyncClient(timeout=20, trust_env=False) as client:
             response = await client.get(
                 f"{self.settings.domain}/open-apis/authen/v1/user_info",
                 headers={"Authorization": f"Bearer {access_token}"},
             )
         payload = response.json()
-        user_id = payload.get("data", {}).get("open_id")
-        if response.is_error or payload.get("code") or not user_id:
+        data = payload.get("data", {})
+        open_id = data.get("open_id")
+        if response.is_error or payload.get("code") or not open_id:
             raise RuntimeError(payload.get("msg") or "无法获取授权用户信息")
-        return user_id
+        return {
+            "open_id": open_id,
+            "user_id": data.get("user_id", ""),
+            "union_id": data.get("union_id", ""),
+        }
 
     @staticmethod
-    def _stored_token(user_id: str, payload: dict) -> OAuthToken:
+    def _stored_token(
+        identity: FeishuIdentity,
+        payload: dict,
+        actual_user: dict[str, str] | None = None,
+    ) -> OAuthToken:
         now = int(time.time() * 1000)
+        actual_user = actual_user or {}
         return OAuthToken(
-            user_id=user_id,
+            user_id=identity.subject_id,
+            tenant_key=identity.tenant_key,
+            app_id=identity.app_id,
+            open_id=actual_user.get("open_id") or identity.open_id,
+            tenant_user_id=actual_user.get("user_id") or identity.user_id,
+            union_id=actual_user.get("union_id") or identity.union_id,
             access_token=payload["access_token"],
             refresh_token=payload.get("refresh_token", ""),
             expires_at=now + int(payload.get("expires_in", 7200)) * 1000,
             refresh_expires_at=now + int(payload.get("refresh_token_expires_in", 30 * 86400)) * 1000,
             scope=payload.get("scope", ""),
+        )
+
+    @staticmethod
+    def _context(token: OAuthToken) -> UserTokenContext:
+        scopes = frozenset(item for item in token.scope.replace(",", " ").split() if item)
+        return UserTokenContext(
+            tenant_key=token.tenant_key,
+            app_id=token.app_id,
+            subject_id=token.user_id,
+            open_id=token.open_id or token.user_id,
+            access_token=token.access_token,
+            expires_at=datetime.fromtimestamp(token.expires_at / 1000, UTC),
+            scopes=scopes,
         )

@@ -310,7 +310,12 @@ class ReActRuntime:
             tool_schema_count=len(tool_schemas),
         )
 
-        return _normalize_tool_decision(context, decision, tool_schemas)
+        return _normalize_tool_decision(
+            context,
+            decision,
+            tool_schemas,
+            observations,
+        )
 
     def _infer_capabilities(
         self,
@@ -338,23 +343,7 @@ class ReActRuntime:
         if any(kw in user_text for kw in ["文档", "记录", "document"]):
             capabilities.add("documents")
 
-        if any(
-            kw in user_text
-            for kw in [
-                "搜索",
-                "查找",
-                "search",
-                "查询",
-                "检索",
-                "天气",
-                "气温",
-                "下雨",
-                "降雨",
-                "空气质量",
-                "weather",
-                "forecast",
-            ]
-        ):
+        if _needs_websearch(user_text):
             capabilities.add("websearch")
 
         if any(kw in user_text for kw in ["偏好", "设置", "preference"]):
@@ -567,6 +556,7 @@ class ReActRuntime:
                 context,
                 decision,
                 self.tools.schemas(),
+                observations,
             )
             if self.recorder is not None:
                 await self.recorder.record_decision(context, step_index, decision)
@@ -713,26 +703,71 @@ def _normalize_tool_decision(
     context: AgentContext,
     decision: AgentDecision,
     tool_schemas: list[dict],
+    observations: list[dict[str, str]],
 ) -> AgentDecision:
+    visible_tools = {str(schema.get("name") or "") for schema in tool_schemas}
+    search_already_ran = any(
+        observation.get("tool") == "websearch.search"
+        for observation in observations
+    )
+    if (
+        decision.type == "final_answer"
+        and "websearch.search" in visible_tools
+        and _needs_websearch(context.user_text)
+        and not search_already_ran
+    ):
+        return _websearch_decision(context, decision.arguments)
     if decision.type != "tool_call":
         return decision
-    visible_tools = {str(schema.get("name") or "") for schema in tool_schemas}
     if decision.tool_name in visible_tools:
         return decision
-    weather_terms = ("天气", "气温", "下雨", "降雨", "空气质量", "weather", "forecast")
     if (
         "websearch.search" in visible_tools
-        and any(term in context.user_text.lower() for term in weather_terms)
+        and _needs_websearch(context.user_text)
     ):
-        return decision.model_copy(
-            update={
-                "tool_name": "websearch.search",
-                "arguments": {
-                    "query": context.user_text,
-                    "provider": "auto",
-                    "max_results": 5,
-                },
-                "decision_summary": "搜索天气信息",
-            }
-        )
+        return _websearch_decision(context, decision.arguments)
     return decision
+
+
+def _needs_websearch(text: str) -> bool:
+    terms = (
+        "搜索",
+        "查找",
+        "search",
+        "查询",
+        "检索",
+        "天气",
+        "气温",
+        "下雨",
+        "降雨",
+        "空气质量",
+        "weather",
+        "forecast",
+        "最新",
+        "新闻",
+        "资讯",
+        "recent",
+        "latest",
+        "news",
+    )
+    lowered = text.lower()
+    return any(term in lowered for term in terms)
+
+
+def _websearch_decision(
+    context: AgentContext,
+    arguments: dict,
+) -> AgentDecision:
+    max_results = arguments.get("max_results", arguments.get("num_results", 5))
+    if not isinstance(max_results, int):
+        max_results = 5
+    return AgentDecision(
+        type="tool_call",
+        tool_name="websearch.search",
+        arguments={
+            "query": str(arguments.get("query") or context.user_text),
+            "provider": "auto",
+            "max_results": min(max(max_results, 1), 20),
+        },
+        decision_summary="搜索最新信息",
+    )

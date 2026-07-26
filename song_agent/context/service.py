@@ -5,14 +5,19 @@ from __future__ import annotations
 import logging
 import uuid
 
+from pydantic import ValidationError
+
 from ..domain.intents import UserRequest
-from ..llm import StructuredLlm
+from ..llm import LLMInvalidResponseError, StructuredLlm
 from ..store import SqliteStore
 from .builders import BusinessContextBuilder
 from .models import ConversationSummary
 
 SUMMARY_PROMPT = """你是会话压缩器。只提取明确事实，不猜测。
 输出结构化摘要：participants、active_topics、open_loops、decisions、memory_updates。
+open_loops 必须是对象数组，每项格式 {"description":"待办内容"}。
+memory_updates 必须是对象数组，每项包含 memory_type、memory_key、
+memory_value、confidence；禁止输出纯字符串。
 memory_updates 只包含稳定偏好、称呼、默认时区、默认时长和长期约束；
 不得写入 PendingAction、message_id、API 返回值、临时错误或工具状态。"""
 
@@ -94,13 +99,21 @@ class ConversationContextService:
             f"已有摘要：{previous.model_dump_json() if previous else '{}'}\n"
             f"待压缩消息：\n{transcript}"
         )
-        summary = await self.llm.generate(
-            ConversationSummary,
-            SUMMARY_PROMPT,
-            prompt,
-            run_id=f"summary:{context.session_id[:12]}",
-            max_tokens=1800,
-        )
+        try:
+            summary = await self.llm.generate(
+                ConversationSummary,
+                SUMMARY_PROMPT,
+                prompt,
+                run_id=f"summary:{context.session_id[:12]}",
+                max_tokens=1800,
+            )
+        except (LLMInvalidResponseError, ValidationError) as error:
+            self.logger.warning(
+                "会话摘要结构无效，使用空摘要保留最近消息 session=%s error=%s",
+                context.session_id,
+                str(error)[:300],
+            )
+            summary = ConversationSummary()
         await self.store.save_conversation_summary(
             context.session_id,
             summary,

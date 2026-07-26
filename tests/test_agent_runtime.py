@@ -239,6 +239,53 @@ async def test_weather_alias_uses_visible_websearch_tool() -> None:
     ]
 
 
+@pytest.mark.asyncio
+async def test_latest_news_forces_websearch_when_model_claims_tool_missing() -> None:
+    calls = []
+
+    async def handler(ctx: AgentContext, arguments: dict[str, Any]) -> ToolResult:
+        calls.append(arguments)
+        return ToolResult(status="ok", summary="找到最新消息")
+
+    registry = ToolRegistry()
+    registry.register(
+        AgentTool(
+            name="websearch.search",
+            description="search web",
+            handler=handler,
+            category="local",
+        )
+    )
+    agent = ReActRuntime(
+        FakeLlm(
+            [
+                AgentDecision(
+                    type="final_answer",
+                    content="没有可用网络搜索工具",
+                ),
+                AgentDecision(type="final_answer", content="最新消息摘要"),
+            ]
+        ),
+        registry,
+        ToolPolicyGuard(),
+        AgentLimits(max_steps=3, max_tool_calls=2, timeout_seconds=5),
+    )
+    ctx = context()
+    ctx.user_text = "谷歌GPT最新消息"
+
+    result = await agent.run(ctx)
+
+    assert result.status == "completed"
+    assert calls == [
+        {
+            "query": "谷歌GPT最新消息",
+            "provider": "auto",
+            "max_results": 5,
+        }
+    ]
+    assert result.response == "最新消息摘要"
+
+
 def test_registry_rejects_llm_visible_commit_tools() -> None:
     async def handler(ctx: AgentContext, arguments: dict[str, Any]) -> ToolResult:
         del ctx, arguments

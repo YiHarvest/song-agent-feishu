@@ -1,8 +1,14 @@
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import pytest
 
 from song_agent.application.request_router import RequestRouter
 from song_agent.domain.intents import ExtractedIntent, UserRequest
-from song_agent.intelligence.intent_extractor import IntentExtractor
+from song_agent.intelligence.intent_extractor import (
+    IntentExtractor,
+    _extract_numbered_reminders,
+)
 from song_agent.llm import LLMInvalidResponseError
 from song_agent.models import FeishuIdentity
 
@@ -95,6 +101,35 @@ async def test_intent_extractor_falls_back_to_agent_after_two_invalid_outputs() 
     assert result.intent == "conversation.general"
     assert result.confidence == 1.0
     assert llm.calls == 2
+
+
+def test_numbered_reminders_are_parsed_without_llm() -> None:
+    result = _extract_numbered_reminders(
+        "给我定两个闹钟：\n"
+        "1. 明天早上6点钟起床的闹钟\n"
+        "2. 每天晚上9点复盘的闹钟",
+        "Asia/Shanghai",
+        now=datetime(2026, 7, 26, 23, 13, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert result
+    assert result.intent == "reminder.batch_create"
+    assert result.arguments["items"] == [
+        {
+            "summary": "起床",
+            "start_time": "2026-07-27T06:00:00+08:00",
+            "timezone": "Asia/Shanghai",
+            "reminder_minutes": [0],
+            "recurrence": None,
+        },
+        {
+            "summary": "复盘",
+            "start_time": "2026-07-27T21:00:00+08:00",
+            "timezone": "Asia/Shanghai",
+            "reminder_minutes": [0],
+            "recurrence": "FREQ=DAILY",
+        },
+    ]
 
 
 @pytest.mark.asyncio

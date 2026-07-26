@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from pydantic import ValidationError
+
+from ..domain.commands import CalendarCreateCommand
 from ..domain.intents import UserRequest
+from ..domain.policies import normalize_calendar_create
 from ..domain.results import ApplicationResult
 from .calendar_service import CalendarApplicationService
 
@@ -59,6 +63,53 @@ class ReminderApplicationService:
         result.intent = "reminder.query"
         result.message = "提醒查询完成。"
         return result
+
+    async def prepare_batch_create(
+        self,
+        request: UserRequest,
+        arguments: dict,
+    ) -> ApplicationResult:
+        raw_items = arguments.get("items")
+        if not isinstance(raw_items, list) or len(raw_items) < 2:
+            return ApplicationResult(
+                status="clarification_required",
+                intent="reminder.batch_create",
+                message="批量提醒至少需要两项。",
+            )
+        try:
+            items = [
+                normalize_calendar_create(
+                    CalendarCreateCommand.model_validate(item),
+                    default_timezone=self.calendar.default_timezone,
+                    default_duration_minutes=1,
+                    repair_nonpositive_duration=True,
+                ).model_dump(mode="json")
+                for item in raw_items
+            ]
+        except (ValidationError, ValueError) as error:
+            return ApplicationResult(
+                status="clarification_required",
+                intent="reminder.batch_create",
+                message=str(error),
+            )
+        action_ids: list[str] = []
+        for index, item in enumerate(items):
+            item_request = request.model_copy(
+                update={"message_id": f"{request.message_id}:reminder:{index}"}
+            )
+            result = await self.prepare_create(item_request, item)
+            if result.status != "awaiting_confirmation":
+                return result.model_copy(
+                    update={"data": {**result.data, "action_ids": action_ids}}
+                )
+            action_ids.append(result.action_id)
+        return ApplicationResult(
+            status="awaiting_confirmation",
+            intent="reminder.batch_create",
+            action_id=action_ids[0],
+            message=f"已准备 {len(action_ids)} 个提醒，等待逐一确认。",
+            data={"action_ids": action_ids},
+        )
 
     async def prepare_cancel(
         self,

@@ -192,3 +192,44 @@ async def test_reminder_repairs_equal_start_and_end_to_one_minute(tmp_path: Path
         assert normalized_end - normalized_start == timedelta(minutes=1)
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_batch_reminders_prepare_independent_actions(tmp_path: Path) -> None:
+    store = await make_store(tmp_path)
+    try:
+        calendar = CalendarApplicationService(
+            OAuth(),
+            PendingActionService(store),
+            OpenApi(),
+            default_timezone="Asia/Shanghai",
+        )
+        service = ReminderApplicationService(calendar)
+        tomorrow = datetime.now(UTC) + timedelta(days=1)
+        result = await service.prepare_batch_create(
+            request(),
+            {
+                "items": [
+                    {"summary": "起床", "start_time": tomorrow.isoformat()},
+                    {
+                        "summary": "复盘",
+                        "start_time": (tomorrow + timedelta(hours=1)).isoformat(),
+                        "recurrence": "FREQ=DAILY",
+                    },
+                ]
+            },
+        )
+
+        assert result.status == "awaiting_confirmation"
+        assert len(result.data["action_ids"]) == 2
+        actions = [
+            await store.get_pending_action(action_id)
+            for action_id in result.data["action_ids"]
+        ]
+        assert [action.payload["summary"] for action in actions if action] == [
+            "起床",
+            "复盘",
+        ]
+        assert actions[1] and actions[1].payload["recurrence"] == "FREQ=DAILY"
+    finally:
+        await store.close()

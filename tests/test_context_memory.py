@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from song_agent.context.builders import AgentRuntimeContextBuilder, BusinessContextBuilder
-from song_agent.context.models import ContextBudget
+from song_agent.context.models import ContextBudget, ConversationSummary
 from song_agent.context.service import ConversationContextService
 from song_agent.domain.intents import UserRequest
 from song_agent.models import FeishuIdentity
@@ -32,6 +32,25 @@ class SummaryLlm:
                 ],
             }
         )
+
+
+def test_summary_accepts_string_open_loops_and_memory_facts() -> None:
+    summary = ConversationSummary.model_validate(
+        {
+            "open_loops": ["设定喝水闹钟未确认"],
+            "memory_updates": [
+                "助手称呼：宋管家",
+                "长期约束：回答必须简短",
+                "长期约束：助手不支持天气查询功能",
+            ],
+        }
+    )
+
+    assert summary.open_loops == [{"description": "设定喝水闹钟未确认"}]
+    assert summary.memory_updates[0].memory_key == "助手称呼"
+    assert summary.memory_updates[0].memory_value == "宋管家"
+    assert summary.memory_updates[1].memory_type == "constraint"
+    assert len(summary.memory_updates) == 2
 
 
 async def make_store(tmp_path: Path) -> SqliteStore:

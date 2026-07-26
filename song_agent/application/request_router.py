@@ -9,6 +9,7 @@ from ..domain.intents import DETERMINISTIC_INTENTS, UserRequest
 from ..domain.results import ApplicationResult
 from ..intelligence.general_agent import GeneralAgent
 from ..intelligence.intent_extractor import IntentExtractor
+from ..llm import LLMTimeoutError
 from .calendar_service import CalendarApplicationService
 from .pending_action_service import PendingActionApplicationService
 from .reminder_service import ReminderApplicationService
@@ -54,7 +55,16 @@ class RequestRouter:
         business_context = await self.business_contexts.build_for_intent_extraction(
             request
         )
-        extracted = await self.intent_extractor.extract(request, business_context)
+        try:
+            extracted = await self.intent_extractor.extract(request, business_context)
+        except LLMTimeoutError:
+            result = ApplicationResult(
+                status="error",
+                intent="conversation.general",
+                message="模型服务响应超时，请稍后重试；无需重新授权。",
+            )
+            await self.conversation_contexts.record_assistant(request, result.message)
+            return result
         if extracted.confidence < self.minimum_confidence:
             result = ApplicationResult(
                 status="clarification_required",
@@ -95,6 +105,11 @@ class RequestRouter:
             result = await self.tasks.prepare_delete(request, extracted.arguments)
         elif extracted.intent == "reminder.create":
             result = await self.reminders.prepare_create(request, extracted.arguments)
+        elif extracted.intent == "reminder.batch_create":
+            result = await self.reminders.prepare_batch_create(
+                request,
+                extracted.arguments,
+            )
         elif extracted.intent == "reminder.query":
             result = await self.reminders.query(request, extracted.arguments)
         elif extracted.intent == "reminder.cancel":

@@ -16,6 +16,15 @@ class Store:
         return None
 
 
+class BatchStore(Store):
+    async def get_pending_action(self, action_id):
+        return SimpleNamespace(
+            action_id=action_id,
+            action_type="reminder.create",
+            payload={"summary": action_id},
+        )
+
+
 class Transport:
     def __init__(self) -> None:
         self.messages: list[tuple[str, str]] = []
@@ -25,9 +34,30 @@ class Transport:
         return f"message-{len(self.messages)}"
 
 
+class BatchTransport(Transport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.confirmations = []
+
+    async def send_confirmation_card(self, chat_id, markdown, action):
+        self.confirmations.append((chat_id, action.action_id))
+        return f"confirmation-{len(self.confirmations)}"
+
+
 class Router:
     async def handle(self, request):
         return ApplicationResult(status="ok", message="处理完成")
+
+
+class BatchRouter:
+    async def handle(self, request):
+        return ApplicationResult(
+            status="awaiting_confirmation",
+            intent="reminder.batch_create",
+            message="已准备 2 个提醒。",
+            action_id="action-1",
+            data={"action_ids": ["action-1", "action-2"]},
+        )
 
 
 def incoming(text: str = "杭州萧山天气怎么样") -> IncomingMessage:
@@ -67,4 +97,19 @@ async def test_general_request_logs_content_and_sends_processing_status(caplog) 
     assert instance.transport.messages == [
         ("chat-1", "⏳ 正在处理你的请求，请稍候…"),
         ("chat-1", "处理完成"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_batch_result_sends_each_confirmation_card() -> None:
+    instance = workflow()
+    instance.store = BatchStore()
+    instance.transport = BatchTransport()
+    instance.request_router = BatchRouter()
+
+    await instance._handle(incoming("创建两个闹钟"))
+
+    assert instance.transport.confirmations == [
+        ("chat-1", "action-1"),
+        ("chat-1", "action-2"),
     ]

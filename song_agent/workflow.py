@@ -135,8 +135,7 @@ class AgentWorkflow:
                     self.logger.exception("Agent 工作流执行失败")
                     await self.transport.send_markdown(
                         message.chat_id,
-                        "处理失败，详细原因已写入服务日志。请稍后重试；"
-                        "若刚调整过权限，请重新完成你自己的飞书授权。",
+                        "处理失败，详细原因已写入服务日志。请稍后重试。",
                     )
         if not lock.locked():
             self._locks.pop(key, None)
@@ -219,14 +218,18 @@ class AgentWorkflow:
                 )
             )
             if result.status == "awaiting_confirmation":
-                action = await self.store.get_pending_action(result.action_id)
-                if not action:
-                    raise RuntimeError("应用服务返回的 PendingAction 不存在")
-                await self.transport.send_confirmation_card(
-                    message.chat_id,
-                    action_confirmation_markdown(action),
-                    action,
-                )
+                action_ids = result.data.get("action_ids")
+                if not isinstance(action_ids, list):
+                    action_ids = [result.action_id]
+                for action_id in action_ids:
+                    action = await self.store.get_pending_action(str(action_id))
+                    if not action:
+                        raise RuntimeError("应用服务返回的 PendingAction 不存在")
+                    await self.transport.send_confirmation_card(
+                        message.chat_id,
+                        action_confirmation_markdown(action),
+                        action,
+                    )
             elif result.message:
                 await self.transport.send_markdown(message.chat_id, render_message(result))
 

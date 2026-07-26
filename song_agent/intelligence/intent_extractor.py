@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import logging
+import re
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
 
@@ -28,6 +31,8 @@ assignee_open_ids、follower_open_ids、reminder_minutes、repeat_rule、tasklis
 task.query 使用 query、task_guid、completed、page_size。
 task.update 使用 task_guid、fields；task.complete/task.delete 使用 task_guid。
 reminder.query 使用日历查询字段；reminder.cancel 使用 event_id。
+一次请求包含多个提醒时使用 reminder.batch_create，arguments 格式为
+{"items":[CalendarCreateCommand对象,...]}。
 时间必须输出带时区 ISO 8601。相对时间按提供的当前时间计算。
 缺少创建所需字段时写入 missing_fields，禁止猜测。
 普通对话和开放分析使用 conversation.general/content.summarize/content.analyze。
@@ -47,6 +52,9 @@ class IntentExtractor:
         request: UserRequest,
         business_context: BusinessContext | None = None,
     ) -> ExtractedIntent:
+        batch = _extract_numbered_reminders(request.text, self.timezone)
+        if batch is not None:
+            return batch
         context = (
             f"当前时间：{current_time_context(self.timezone)}\n"
             f"默认时区：{self.timezone}\n"
@@ -107,3 +115,67 @@ class IntentExtractor:
                     intent="conversation.general",
                     confidence=1.0,
                 )
+
+
+def _extract_numbered_reminders(
+    text: str,
+    timezone: str,
+    *,
+    now: datetime | None = None,
+) -> ExtractedIntent | None:
+    if not any(keyword in text for keyword in ("闹钟", "提醒")):
+        return None
+    parts = re.findall(
+        r"(?:^|\n)\s*\d+[.、)]\s*(.+?)(?=(?:\n\s*\d+[.、)])|\Z)",
+        text,
+        flags=re.DOTALL,
+    )
+    if len(parts) < 2:
+        return None
+    zone = ZoneInfo(timezone)
+    current = now.astimezone(zone) if now else datetime.now(zone)
+    items: list[dict] = []
+    for part in parts:
+        match = re.search(
+            r"(?:(早上|上午|中午|下午|晚上|夜里)\s*)?"
+            r"(\d{1,2})点(?:钟)?(?:(半)|(\d{1,2})分)?",
+            part,
+        )
+        if match is None:
+            return None
+        period, hour_text, half, minute_text = match.groups()
+        hour = int(hour_text)
+        minute = 30 if half else int(minute_text or 0)
+        if period in {"下午", "晚上", "夜里"} and hour < 12:
+            hour += 12
+        elif period == "中午" and hour < 11:
+            hour += 12
+        if hour > 23 or minute > 59:
+            return None
+        recurrence = "FREQ=DAILY" if "每天" in part else None
+        day_offset = 2 if "后天" in part else 1 if "明天" in part else 0
+        start = datetime.combine(
+            current.date() + timedelta(days=day_offset),
+            datetime.min.time(),
+            tzinfo=zone,
+        ).replace(hour=hour, minute=minute)
+        if recurrence and start <= current:
+            start += timedelta(days=1)
+        if not recurrence and start <= current and day_offset == 0:
+            return None
+        summary = part[match.end():]
+        summary = re.sub(r"(?:的)?(?:闹钟|提醒)\s*$", "", summary).strip()
+        items.append(
+            {
+                "summary": summary or "提醒",
+                "start_time": start.isoformat(),
+                "timezone": timezone,
+                "reminder_minutes": [0],
+                "recurrence": recurrence,
+            }
+        )
+    return ExtractedIntent(
+        intent="reminder.batch_create",
+        arguments={"items": items},
+        confidence=1.0,
+    )

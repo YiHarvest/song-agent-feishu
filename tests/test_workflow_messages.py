@@ -50,13 +50,16 @@ class Router:
 
 
 class BatchRouter:
+    def __init__(self, action_ids):
+        self.action_ids = action_ids
+
     async def handle(self, request):
         return ApplicationResult(
             status="awaiting_confirmation",
             intent="reminder.batch_create",
-            message="已准备 2 个提醒。",
-            action_id="action-1",
-            data={"action_ids": ["action-1", "action-2"]},
+            message=f"已准备 {len(self.action_ids)} 个提醒。",
+            action_id=self.action_ids[0],
+            data={"action_ids": self.action_ids},
         )
 
 
@@ -100,16 +103,17 @@ async def test_general_request_logs_content_and_sends_processing_status(caplog) 
     ]
 
 
+@pytest.mark.parametrize("action_count", [3, 5])
 @pytest.mark.asyncio
-async def test_batch_result_sends_each_confirmation_card() -> None:
+async def test_batch_result_sends_each_confirmation_card(action_count: int) -> None:
+    action_ids = [f"action-{index}" for index in range(1, action_count + 1)]
     instance = workflow()
     instance.store = BatchStore()
     instance.transport = BatchTransport()
-    instance.request_router = BatchRouter()
+    instance.request_router = BatchRouter(action_ids)
 
-    await instance._handle(incoming("创建两个闹钟"))
+    await instance._handle(incoming(f"创建{action_count}个闹钟"))
 
     assert instance.transport.confirmations == [
-        ("chat-1", "action-1"),
-        ("chat-1", "action-2"),
+        ("chat-1", action_id) for action_id in action_ids
     ]

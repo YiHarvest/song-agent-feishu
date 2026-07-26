@@ -140,7 +140,13 @@ CREATE TABLE IF NOT EXISTS pending_actions (
     remote_resource_id TEXT NOT NULL DEFAULT '',
     remote_request_id TEXT NOT NULL DEFAULT '',
     last_error_code TEXT NOT NULL DEFAULT '',
-    last_error_message TEXT NOT NULL DEFAULT ''
+    last_error_message TEXT NOT NULL DEFAULT '',
+    payload_version INTEGER NOT NULL DEFAULT 1,
+    idempotency_key TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'legacy_agent',
+    source_card_message_id TEXT NOT NULL DEFAULT '',
+    result_json TEXT NOT NULL DEFAULT '{}',
+    updated_at INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS action_attempts (
@@ -300,12 +306,75 @@ CREATE TABLE IF NOT EXISTS document_bindings (
     PRIMARY KEY (tenant_key, app_id, chat_id, thread_id, subject_id)
 );
 
+CREATE TABLE IF NOT EXISTS conversation_messages (
+    row_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    tenant_key TEXT NOT NULL,
+    app_id TEXT NOT NULL,
+    principal_id TEXT NOT NULL,
+    chat_id TEXT NOT NULL DEFAULT '',
+    thread_id TEXT NOT NULL DEFAULT '',
+    message_id TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'tool', 'system')),
+    content TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    summarized_at INTEGER,
+    UNIQUE (tenant_key, app_id, principal_id, message_id)
+);
+
+CREATE TABLE IF NOT EXISTS conversation_summaries (
+    summary_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    tenant_key TEXT NOT NULL,
+    app_id TEXT NOT NULL,
+    principal_id TEXT NOT NULL,
+    summary_json TEXT NOT NULL,
+    covered_message_count INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (tenant_key, app_id, principal_id, session_id)
+);
+
+CREATE TABLE IF NOT EXISTS user_memories (
+    memory_id TEXT PRIMARY KEY,
+    tenant_key TEXT NOT NULL,
+    app_id TEXT NOT NULL,
+    principal_id TEXT NOT NULL,
+    memory_type TEXT NOT NULL,
+    memory_key TEXT NOT NULL,
+    memory_value TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    source_message_id TEXT NOT NULL DEFAULT '',
+    valid_from TEXT NOT NULL,
+    valid_until TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (tenant_key, app_id, principal_id, memory_type, memory_key)
+);
+
+CREATE TABLE IF NOT EXISTS tool_results (
+    result_ref TEXT PRIMARY KEY,
+    tenant_key TEXT NOT NULL,
+    app_id TEXT NOT NULL,
+    principal_id TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    truncated INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER
+);
+
 CREATE INDEX IF NOT EXISTS idx_processed_events_time ON processed_events(processed_at);
 CREATE INDEX IF NOT EXISTS idx_pending_actions_expiry ON pending_actions(status, expires_at);
 CREATE INDEX IF NOT EXISTS idx_action_outbox_ready ON action_outbox(status, available_at);
 CREATE INDEX IF NOT EXISTS idx_oauth_authorizations_expiry ON oauth_authorizations(expires_at);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_principal
 ON agent_runs(tenant_key, app_id, principal_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_conversation_messages_recent
+ON conversation_messages(tenant_key, app_id, principal_id, session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_user_memories_principal
+ON user_memories(tenant_key, app_id, principal_id, updated_at);
 """
 
 
@@ -1399,8 +1468,12 @@ class SqliteStore:
             INSERT INTO pending_actions(
                 action_id, tenant_key, app_id, chat_id, thread_id,
                 creator_subject_id, creator_open_id, action_type, payload_json,
-                payload_hash, source_message_id, status, expires_at, created_at, consumed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                payload_hash, source_message_id, status, expires_at, created_at, consumed_at,
+                payload_version, idempotency_key, source, source_card_message_id,
+                result_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(tenant_key, app_id, idempotency_key) WHERE idempotency_key != ''
+            DO NOTHING
             """,
             (
                 action.action_id,
@@ -1418,6 +1491,12 @@ class SqliteStore:
                 action.expires_at,
                 action.created_at,
                 action.consumed_at,
+                action.payload_version,
+                action.idempotency_key,
+                action.source,
+                action.source_card_message_id,
+                json.dumps(action.result, ensure_ascii=False, sort_keys=True),
+                action.created_at,
             ),
         )
         await self.db.commit()
@@ -1449,7 +1528,70 @@ class SqliteStore:
             attempt_count=row["attempt_count"],
             remote_resource_id=row["remote_resource_id"],
             remote_request_id=row["remote_request_id"],
+            payload_version=row["payload_version"],
+            idempotency_key=row["idempotency_key"],
+            source=row["source"],
+            source_card_message_id=row["source_card_message_id"],
+            error_code=row["last_error_code"],
+            error_message=row["last_error_message"],
+            result=json.loads(row["result_json"] or "{}"),
         )
+
+    async def get_pending_action_by_idempotency(
+        self,
+        *,
+        tenant_key: str,
+        app_id: str,
+        idempotency_key: str,
+    ) -> PendingAction | None:
+        cursor = await self.db.execute(
+            """
+            SELECT action_id FROM pending_actions
+            WHERE tenant_key = ? AND app_id = ? AND idempotency_key = ?
+            """,
+            (tenant_key, app_id or self.app_id, idempotency_key),
+        )
+        row = await cursor.fetchone()
+        return await self.get_pending_action(row["action_id"]) if row else None
+
+    async def list_pending_actions(
+        self,
+        *,
+        tenant_key: str,
+        app_id: str,
+        principal_id: str,
+        limit: int = 100,
+    ) -> list[PendingAction]:
+        cursor = await self.db.execute(
+            """
+            SELECT action_id FROM pending_actions
+            WHERE tenant_key = ? AND app_id = ? AND creator_subject_id = ?
+            ORDER BY created_at DESC LIMIT ?
+            """,
+            (tenant_key, app_id or self.app_id, principal_id, limit),
+        )
+        actions: list[PendingAction] = []
+        for row in await cursor.fetchall():
+            action = await self.get_pending_action(row["action_id"])
+            if action:
+                actions.append(action)
+        return actions
+
+    async def set_pending_action_card_message(
+        self,
+        action_id: str,
+        message_id: str,
+    ) -> bool:
+        cursor = await self.db.execute(
+            """
+            UPDATE pending_actions
+            SET source_card_message_id = ?, updated_at = ?
+            WHERE action_id = ?
+            """,
+            (message_id, int(time.time()), action_id),
+        )
+        await self.db.commit()
+        return cursor.rowcount == 1
 
     async def ready_outbox_action_ids(self, *, limit: int = 20) -> list[str]:
         """返回可被执行器认领的持久化动作。
@@ -1673,14 +1815,77 @@ class SqliteStore:
                     (now, now, action_id, actor_open_id, payload_hash, now),
                 )
                 if cursor.rowcount == 1:
+                    action_row = await (
+                        await self.db.execute(
+                            "SELECT action_type FROM pending_actions WHERE action_id = ?",
+                            (action_id,),
+                        )
+                    ).fetchone()
                     await self.db.execute(
                         """
                         INSERT INTO action_outbox(
                             outbox_id, action_id, event_type, payload_json, status,
                             available_at, attempt_count, created_at
-                        ) VALUES (?, ?, 'action.execute', '{}', 'pending', ?, 0, ?)
+                        ) VALUES (?, ?, ?, '{}', 'pending', ?, 0, ?)
                         """,
-                        (str(uuid.uuid4()), action_id, now, now),
+                        (
+                            str(uuid.uuid4()),
+                            action_id,
+                            f"{action_row['action_type']}.requested",
+                            now,
+                            now,
+                        ),
+                    )
+                await self.db.commit()
+                return cursor.rowcount == 1
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def retry_pending_action(
+        self,
+        action_id: str,
+        *,
+        tenant_key: str,
+        app_id: str,
+        principal_id: str,
+    ) -> bool:
+        now = int(time.time())
+        async with self._transaction_lock:
+            await self.db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await self.db.execute(
+                    """
+                    UPDATE pending_actions
+                    SET status = 'confirmed', updated_at = ?,
+                        last_error_code = '', last_error_message = ''
+                    WHERE action_id = ? AND tenant_key = ? AND app_id = ?
+                      AND creator_subject_id = ? AND status = 'failed_retryable'
+                      AND expires_at > ?
+                    """,
+                    (now, action_id, tenant_key, app_id or self.app_id, principal_id, now),
+                )
+                if cursor.rowcount == 1:
+                    action_row = await (
+                        await self.db.execute(
+                            "SELECT action_type FROM pending_actions WHERE action_id = ?",
+                            (action_id,),
+                        )
+                    ).fetchone()
+                    await self.db.execute(
+                        """
+                        INSERT INTO action_outbox(
+                            outbox_id, action_id, event_type, payload_json, status,
+                            available_at, attempt_count, created_at
+                        ) VALUES (?, ?, ?, '{}', 'pending', ?, 0, ?)
+                        """,
+                        (
+                            str(uuid.uuid4()),
+                            action_id,
+                            f"{action_row['action_type']}.requested",
+                            now,
+                            now,
+                        ),
                     )
                 await self.db.commit()
                 return cursor.rowcount == 1
@@ -1794,6 +1999,96 @@ class SqliteStore:
                     )
                     """,
                     ("processed" if success else "failed", now, action_id),
+                )
+                await self.db.commit()
+                return cursor.rowcount == 1
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def complete_pending_action(
+        self,
+        action_id: str,
+        *,
+        status: str,
+        result: dict[str, Any] | None = None,
+        error_code: str = "",
+        error_message: str = "",
+        remote_resource_id: str = "",
+        remote_request_id: str = "",
+    ) -> bool:
+        if status not in {"succeeded", "failed_retryable", "failed_final"}:
+            raise ValueError(f"unsupported terminal status: {status}")
+        now = int(time.time())
+        result_json = json.dumps(
+            result or {},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        async with self._transaction_lock:
+            await self.db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await self.db.execute(
+                    """
+                    UPDATE pending_actions
+                    SET status = ?, completed_at = CASE
+                            WHEN ? IN ('succeeded', 'failed_final') THEN ? ELSE NULL END,
+                        claimed_by = NULL, claim_expires_at = NULL,
+                        result_json = ?, last_error_code = ?, last_error_message = ?,
+                        remote_resource_id = ?, remote_request_id = ?, updated_at = ?
+                    WHERE action_id = ? AND status = 'executing'
+                    """,
+                    (
+                        status,
+                        status,
+                        now,
+                        result_json,
+                        error_code,
+                        error_message[:500],
+                        remote_resource_id,
+                        remote_request_id,
+                        now,
+                        action_id,
+                    ),
+                )
+                await self.db.execute(
+                    """
+                    UPDATE action_attempts
+                    SET status = ?, completed_at = ?, error_code = ?, error_message = ?,
+                        remote_resource_id = ?, remote_request_id = ?
+                    WHERE attempt_id = (
+                        SELECT attempt_id FROM action_attempts
+                        WHERE action_id = ? AND status IN ('executing', 'remote_succeeded')
+                        ORDER BY attempt_number DESC LIMIT 1
+                    )
+                    """,
+                    (
+                        status,
+                        now,
+                        error_code,
+                        error_message[:500],
+                        remote_resource_id,
+                        remote_request_id,
+                        action_id,
+                    ),
+                )
+                await self.db.execute(
+                    """
+                    UPDATE action_outbox
+                    SET status = ?, processed_at = ?, claimed_by = NULL,
+                        claim_expires_at = NULL
+                    WHERE outbox_id = (
+                        SELECT outbox_id FROM action_outbox
+                        WHERE action_id = ? AND status = 'processing'
+                        ORDER BY created_at DESC LIMIT 1
+                    )
+                    """,
+                    (
+                        "processed" if status == "succeeded" else "failed",
+                        now,
+                        action_id,
+                    ),
                 )
                 await self.db.commit()
                 return cursor.rowcount == 1
@@ -2036,6 +2331,398 @@ class SqliteStore:
                 int(time.time()),
             ),
         )
+
+    async def append_conversation_message(
+        self,
+        *,
+        session_id: str,
+        message_id: str,
+        role: str,
+        content: str,
+        tenant_key: str,
+        app_id: str,
+        principal_id: str,
+        chat_id: str = "",
+        thread_id: str = "",
+    ) -> bool:
+        cursor = await self.db.execute(
+            """
+            INSERT INTO conversation_messages(
+                row_id, session_id, tenant_key, app_id, principal_id,
+                chat_id, thread_id, message_id, role, content, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(tenant_key, app_id, principal_id, message_id) DO NOTHING
+            """,
+            (
+                str(uuid.uuid4()),
+                session_id,
+                tenant_key,
+                app_id or self.app_id,
+                principal_id,
+                chat_id,
+                thread_id,
+                message_id,
+                role,
+                content,
+                int(time.time()),
+            ),
+        )
+        await self.db.commit()
+        return cursor.rowcount == 1
+
+    async def list_recent_conversation_messages(
+        self,
+        session_id: str,
+        *,
+        tenant_key: str,
+        app_id: str,
+        principal_id: str,
+        limit: int = 8,
+    ):
+        from .context.models import ConversationMessage
+
+        cursor = await self.db.execute(
+            """
+            SELECT message_id, role, content, created_at
+            FROM conversation_messages
+            WHERE tenant_key = ? AND app_id = ? AND principal_id = ?
+              AND session_id = ?
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT ?
+            """,
+            (tenant_key, app_id or self.app_id, principal_id, session_id, limit),
+        )
+        rows = list(reversed(await cursor.fetchall()))
+        return [ConversationMessage.model_validate(dict(row)) for row in rows]
+
+    async def list_conversation_messages_for_compaction(
+        self,
+        session_id: str,
+        *,
+        tenant_key: str,
+        app_id: str,
+        principal_id: str,
+        keep_recent: int,
+        threshold: int,
+    ):
+        from .context.models import ConversationMessage
+
+        count_row = await (
+            await self.db.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM conversation_messages
+                WHERE tenant_key = ? AND app_id = ? AND principal_id = ?
+                  AND session_id = ? AND summarized_at IS NULL
+                """,
+                (tenant_key, app_id or self.app_id, principal_id, session_id),
+            )
+        ).fetchone()
+        if not count_row or count_row["count"] < threshold:
+            return []
+        cursor = await self.db.execute(
+            """
+            SELECT message_id, role, content, created_at
+            FROM conversation_messages
+            WHERE tenant_key = ? AND app_id = ? AND principal_id = ?
+              AND session_id = ? AND summarized_at IS NULL
+            ORDER BY created_at, rowid
+            LIMIT ?
+            """,
+            (
+                tenant_key,
+                app_id or self.app_id,
+                principal_id,
+                session_id,
+                max(0, count_row["count"] - keep_recent),
+            ),
+        )
+        return [
+            ConversationMessage.model_validate(dict(row))
+            for row in await cursor.fetchall()
+        ]
+
+    async def get_conversation_summary(
+        self,
+        session_id: str,
+        *,
+        tenant_key: str,
+        app_id: str,
+        principal_id: str,
+    ):
+        from .context.models import ConversationSummary
+
+        row = await (
+            await self.db.execute(
+                """
+                SELECT summary_json
+                FROM conversation_summaries
+                WHERE tenant_key = ? AND app_id = ? AND principal_id = ?
+                  AND session_id = ?
+                """,
+                (tenant_key, app_id or self.app_id, principal_id, session_id),
+            )
+        ).fetchone()
+        return (
+            ConversationSummary.model_validate_json(row["summary_json"])
+            if row
+            else None
+        )
+
+    async def save_conversation_summary(
+        self,
+        session_id: str,
+        summary,
+        *,
+        covered_message_ids: list[str],
+        tenant_key: str,
+        app_id: str,
+        principal_id: str,
+    ) -> None:
+        now = int(time.time())
+        async with self._transaction_lock:
+            await self.db.execute("BEGIN IMMEDIATE")
+            try:
+                await self.db.execute(
+                    """
+                    INSERT INTO conversation_summaries(
+                        summary_id, session_id, tenant_key, app_id, principal_id,
+                        summary_json, covered_message_count, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(tenant_key, app_id, principal_id, session_id)
+                    DO UPDATE SET
+                        summary_json = excluded.summary_json,
+                        covered_message_count =
+                            conversation_summaries.covered_message_count
+                            + excluded.covered_message_count,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        session_id,
+                        tenant_key,
+                        app_id or self.app_id,
+                        principal_id,
+                        summary.model_dump_json(),
+                        len(covered_message_ids),
+                        now,
+                        now,
+                    ),
+                )
+                if covered_message_ids:
+                    placeholders = ",".join("?" for _ in covered_message_ids)
+                    await self.db.execute(
+                        f"""
+                        UPDATE conversation_messages
+                        SET summarized_at = ?
+                        WHERE tenant_key = ? AND app_id = ? AND principal_id = ?
+                          AND session_id = ? AND message_id IN ({placeholders})
+                        """,
+                        (
+                            now,
+                            tenant_key,
+                            app_id or self.app_id,
+                            principal_id,
+                            session_id,
+                            *covered_message_ids,
+                        ),
+                    )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def upsert_user_memory(
+        self,
+        memory,
+        *,
+        tenant_key: str,
+        app_id: str,
+        principal_id: str,
+    ) -> None:
+        from datetime import UTC, datetime
+
+        now = datetime.now(UTC).isoformat()
+        await self.db.execute(
+            """
+            INSERT INTO user_memories(
+                memory_id, tenant_key, app_id, principal_id,
+                memory_type, memory_key, memory_value, confidence,
+                source_message_id, valid_from, valid_until,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(
+                tenant_key, app_id, principal_id, memory_type, memory_key
+            ) DO UPDATE SET
+                memory_value = excluded.memory_value,
+                confidence = excluded.confidence,
+                source_message_id = excluded.source_message_id,
+                valid_until = excluded.valid_until,
+                updated_at = excluded.updated_at
+            """,
+            (
+                str(uuid.uuid4()),
+                tenant_key,
+                app_id or self.app_id,
+                principal_id,
+                memory.memory_type,
+                memory.memory_key,
+                memory.memory_value,
+                memory.confidence,
+                memory.source_message_id,
+                now,
+                memory.valid_until,
+                now,
+                now,
+            ),
+        )
+        await self.db.commit()
+
+    async def list_user_memories(
+        self,
+        *,
+        tenant_key: str,
+        app_id: str,
+        principal_id: str,
+        keys: list[str] | None = None,
+        limit: int = 20,
+    ):
+        from .context.models import MemoryFact
+
+        query = """
+            SELECT memory_type, memory_key, memory_value, confidence,
+                   source_message_id, valid_until
+            FROM user_memories
+            WHERE tenant_key = ? AND app_id = ? AND principal_id = ?
+              AND (valid_until = '' OR valid_until > ?)
+        """
+        from datetime import UTC, datetime
+
+        params: list[Any] = [
+            tenant_key,
+            app_id or self.app_id,
+            principal_id,
+            datetime.now(UTC).isoformat(),
+        ]
+        if keys:
+            query += f" AND memory_key IN ({','.join('?' for _ in keys)})"
+            params.extend(keys)
+        query += " ORDER BY confidence DESC, updated_at DESC LIMIT ?"
+        params.append(limit)
+        cursor = await self.db.execute(query, params)
+        return [MemoryFact.model_validate(dict(row)) for row in await cursor.fetchall()]
+
+    async def find_active_pending_action(
+        self,
+        *,
+        tenant_key: str,
+        app_id: str,
+        principal_id: str,
+        thread_id: str = "",
+    ) -> dict[str, Any] | None:
+        row = await (
+            await self.db.execute(
+                """
+                SELECT action_id, action_type, status, expires_at, payload_json
+                FROM pending_actions
+                WHERE tenant_key = ? AND app_id = ? AND creator_subject_id = ?
+                  AND thread_id = ?
+                  AND status IN (
+                    'awaiting_confirmation', 'confirmed', 'executing',
+                    'failed_retryable'
+                  )
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (
+                    tenant_key,
+                    app_id or self.app_id,
+                    principal_id,
+                    thread_id,
+                ),
+            )
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "action_id": row["action_id"],
+            "action_type": row["action_type"],
+            "status": row["status"],
+            "expires_at": row["expires_at"],
+            "payload": json.loads(row["payload_json"]),
+        }
+
+    async def save_tool_result(
+        self,
+        *,
+        tenant_key: str,
+        app_id: str,
+        principal_id: str,
+        tool_name: str,
+        summary: str,
+        payload: dict[str, Any],
+        truncated: bool,
+        expires_at: int | None = None,
+    ) -> str:
+        result_ref = f"tool_result_{uuid.uuid4().hex}"
+        await self.db.execute(
+            """
+            INSERT INTO tool_results(
+                result_ref, tenant_key, app_id, principal_id, tool_name,
+                summary, payload_json, truncated, created_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                result_ref,
+                tenant_key,
+                app_id or self.app_id,
+                principal_id,
+                tool_name,
+                summary,
+                json.dumps(payload, ensure_ascii=False),
+                int(truncated),
+                int(time.time()),
+                expires_at,
+            ),
+        )
+        await self.db.commit()
+        return result_ref
+
+    async def get_tool_result(
+        self,
+        result_ref: str,
+        *,
+        tenant_key: str,
+        app_id: str,
+        principal_id: str,
+    ) -> dict[str, Any] | None:
+        row = await (
+            await self.db.execute(
+                """
+                SELECT tool_name, summary, payload_json, truncated, created_at
+                FROM tool_results
+                WHERE result_ref = ? AND tenant_key = ? AND app_id = ?
+                  AND principal_id = ?
+                  AND (expires_at IS NULL OR expires_at > ?)
+                """,
+                (
+                    result_ref,
+                    tenant_key,
+                    app_id or self.app_id,
+                    principal_id,
+                    int(time.time()),
+                ),
+            )
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "result_ref": result_ref,
+            "tool_name": row["tool_name"],
+            "summary": row["summary"],
+            "payload": json.loads(row["payload_json"]),
+            "truncated": bool(row["truncated"]),
+            "created_at": row["created_at"],
+        }
 
 
 def _normalize_legacy_state(value: dict[str, Any]) -> dict[str, Any]:

@@ -20,6 +20,11 @@ from .agent.context import AgentContext
 from .agent.models import AgentResult, ToolResult
 from .agent.runtime import AgentLimits, ReActRuntime
 from .agent.tool_registry import AgentTool, ToolRegistry
+from .application.request_router import RequestRouter
+from .application.result_renderer import render_message
+from .domain.intents import UserRequest
+from .domain.results import ApplicationResult
+from .feishu.cards import action_confirmation_markdown
 from .feishu.mcp import FeishuMcp
 from .feishu.oauth import FeishuOAuth
 from .feishu.openapi import FeishuOpenApi
@@ -49,6 +54,7 @@ from .planner import (
     is_reminder_status_question,
 )
 from .policies.tool_policy import ToolPolicyGuard
+from .search.mcp import SearchMcp
 from .services.agent_runs import AgentRunRecorder
 from .services.audit import AuditService
 from .services.pending_actions import PendingActionService
@@ -71,6 +77,7 @@ class AgentWorkflow:
         oauth: FeishuOAuth,
         openapi: FeishuOpenApi,
         mcp: FeishuMcp,
+        search_mcp: SearchMcp,
         pending_actions: PendingActionService,
         audit: AuditService,
     ) -> None:
@@ -80,11 +87,13 @@ class AgentWorkflow:
         self.oauth = oauth
         self.openapi = openapi
         self.mcp = mcp
+        self.search_mcp = search_mcp
         self.pending_actions = pending_actions
         self.audit = audit
         self.logger = logging.getLogger(__name__)
         self._locks: dict[str, asyncio.Lock] = {}
         self.notify_outbox: Callable[[], None] = lambda: None
+        self.request_router: RequestRouter | None = None
         self.tools = self._build_tool_registry()
         settings = self.oauth.settings
         self.agent_runs = AgentRunRecorder(store, settings.llm_model)
@@ -101,6 +110,9 @@ class AgentWorkflow:
             recorder=self.agent_runs,
             settings=settings,
         )
+
+    def set_request_router(self, router: RequestRouter) -> None:
+        self.request_router = router
 
     async def enqueue(self, message: IncomingMessage) -> None:
         key = message.chat_queue_key(self.oauth.settings.feishu_app_id)
@@ -144,12 +156,14 @@ class AgentWorkflow:
         if not text:
             return
         self.logger.info(
-            "📩 收到用户消息 message_id=%s chat=%s user=%s type=%s text_chars=%d",
+            "📩 收到用户消息 message_id=%s chat=%s user=%s type=%s "
+            "text_chars=%d content=%r",
             message.message_id,
             message.chat_id,
             message.user_id,
             message.chat_type,
             len(text),
+            text,
         )
         date = self.planner.today()
         record = await self.store.get_record(
@@ -187,103 +201,137 @@ class AgentWorkflow:
                 "为防止串用户或确认错草稿，文字“确认”已停用。请点击最新计划卡片上的 **确认创建**。",
             )
         else:
-            # 快速路径：简单请求直接处理，不走完整ReAct
-            quick_response = self._try_quick_response(text, record, date)
-            if quick_response:
-                await self.transport.send_markdown(message.chat_id, quick_response)
-                return
-            
-            # 复杂请求：走完整ReAct流程
-            context = AgentContext(
-                message=message,
-                user_text=text,
-                conversation_key=message.conversation_key(self.oauth.settings.feishu_app_id).serialize(),
-                metadata={
-                    "record": record,
-                    "date": date,
-                    "state_summary": (
-                        f"今天已有{len(record.tasks)}项计划，状态={record.plan_status}"
-                        if record
-                        else "今天暂无计划"
-                    ),
-                    "current_time": datetime.now(ZoneInfo(self.oauth.settings.timezone)).isoformat(
-                        timespec="minutes"
-                    ),
-                    "today_tasks": (
-                        [
-                            {
-                                "id": task.id,
-                                "title": task.title,
-                                "status": task.status,
-                            }
-                            for task in record.tasks
-                        ]
-                        if record
-                        else []
-                    ),
-                },
+            if self.request_router is None:
+                raise RuntimeError("RequestRouter 尚未配置")
+            await self.transport.send_markdown(
+                message.chat_id,
+                "⏳ 正在处理你的请求，请稍候…",
             )
-            acknowledgement = asyncio.create_task(
-                self.transport.send_markdown(message.chat_id, "收到，正在处理…")
-            )
-            acknowledgement.add_done_callback(self._log_background_error)
-            run_id = await self.agent_runs.start(context)
-            try:
-                result = await self.agent_runtime.run(context)
-            except Exception:
-                failed = AgentResult(
-                    status="failed",
-                    response="",
-                    step_count=0,
-                    tool_call_count=0,
-                    error_code="agent_runtime_error",
+            result = await self.request_router.handle(
+                UserRequest(
+                    identity=message.identity(self.oauth.settings.feishu_app_id),
+                    text=text,
+                    source="feishu",
+                    chat_id=message.chat_id,
+                    thread_id=message.thread_id or message.root_id,
+                    message_id=message.message_id,
+                    event_id=message.event_id,
                 )
-                await self.agent_runs.finish(run_id, failed)
-                raise
-            await self.agent_runs.finish(run_id, result)
-            self.logger.info(
-                "ReAct run 完成 message_id=%s status=%s steps=%d tools=%d error=%s",
-                message.message_id,
-                result.status,
-                result.step_count,
-                result.tool_call_count,
-                result.error_code,
             )
-            await self.audit.record(
-                "agent.run",
-                result.status,
-                tenant_key=message.tenant_key,
-                app_id=message.app_id,
-                principal_id=message.user_id,
-                chat_id=message.chat_id,
-                thread_id=message.thread_id or message.root_id,
-                message_id=message.message_id,
-                agent_run_id=run_id,
-                decision=result.error_code or result.status,
-                metadata={
-                    "step_count": result.step_count,
-                    "tool_call_count": result.tool_call_count,
-                    "model": self.oauth.settings.llm_model,
-                },
+            if result.status == "awaiting_confirmation":
+                action = await self.store.get_pending_action(result.action_id)
+                if not action:
+                    raise RuntimeError("应用服务返回的 PendingAction 不存在")
+                await self.transport.send_confirmation_card(
+                    message.chat_id,
+                    action_confirmation_markdown(action),
+                    action,
+                )
+            elif result.message:
+                await self.transport.send_markdown(message.chat_id, render_message(result))
+
+    async def handle_general_request(self, request: UserRequest) -> ApplicationResult:
+        message = IncomingMessage(
+            message_id=request.message_id,
+            event_id=request.event_id,
+            tenant_key=request.identity.tenant_key,
+            app_id=request.identity.app_id,
+            user_id=request.identity.subject_id,
+            open_id=request.identity.open_id,
+            tenant_user_id=request.identity.user_id,
+            union_id=request.identity.union_id,
+            chat_id=request.chat_id,
+            thread_id=request.thread_id,
+            root_id="",
+            chat_type="p2p",
+            message_type="text",
+            text=request.text,
+        )
+        date = self.planner.today()
+        record = await self.store.get_record(
+            message.chat_id,
+            message.user_id,
+            date,
+            tenant_key=message.tenant_key,
+            app_id=message.app_id,
+            thread_id=message.thread_id,
+        )
+        quick_response = self._try_quick_response(request.text, record, date)
+        if quick_response:
+            return ApplicationResult(status="ok", message=quick_response)
+        context = AgentContext(
+            message=message,
+            user_text=request.text,
+            conversation_key=message.conversation_key(
+                self.oauth.settings.feishu_app_id
+            ).serialize(),
+            metadata={
+                **request.context,
+                "record": record,
+                "date": date,
+                "state_summary": (
+                    f"今天已有{len(record.tasks)}项计划，状态={record.plan_status}"
+                    if record
+                    else "今天暂无计划"
+                ),
+                "current_time": datetime.now(
+                    ZoneInfo(self.oauth.settings.timezone)
+                ).isoformat(timespec="minutes"),
+                "today_tasks": (
+                    [
+                        {"id": task.id, "title": task.title, "status": task.status}
+                        for task in record.tasks
+                    ]
+                    if record
+                    else []
+                ),
+            },
+        )
+        run_id = await self.agent_runs.start(context)
+        try:
+            result = await self.agent_runtime.run(context)
+        except Exception:
+            failed = AgentResult(
+                status="failed",
+                response="",
+                step_count=0,
+                tool_call_count=0,
+                error_code="agent_runtime_error",
             )
-            if result.response:
-                await self.transport.send_markdown(message.chat_id, result.response)
+            await self.agent_runs.finish(run_id, failed)
+            raise
+        await self.agent_runs.finish(run_id, result)
+        await self.audit.record(
+            "agent.run",
+            result.status,
+            tenant_key=message.tenant_key,
+            app_id=message.app_id,
+            principal_id=message.user_id,
+            chat_id=message.chat_id,
+            thread_id=message.thread_id,
+            message_id=message.message_id,
+            agent_run_id=run_id,
+            decision=result.error_code or result.status,
+            metadata={
+                "step_count": result.step_count,
+                "tool_call_count": result.tool_call_count,
+                "model": self.oauth.settings.llm_model,
+            },
+        )
+        return ApplicationResult(
+            status="ok" if result.status == "completed" else "error",
+            intent="conversation.general",
+            message=result.response or "处理完成。",
+        )
 
     def _build_tool_registry(self) -> ToolRegistry:
         registry = ToolRegistry()
         definitions = (
             (
                 "plans.save_draft",
-                "根据用户原始消息整理并保存今天的本地计划草稿。",
+                "保存今日计划草稿。用于用户说「今天的计划」「我要做...」等计划类请求。生成多条任务，可选时间。",
                 self._tool_plan_draft,
                 "local",
-                _plan_arguments_schema(),
-            ),
-            (
-                "calendar.prepare_create_event",
-                "根据用户原始消息准备日历事件草稿并发送确认卡片；不会直接写日历。",
-                self._tool_plan_draft,
-                "prepare",
                 _plan_arguments_schema(),
             ),
             (
@@ -307,6 +355,30 @@ class AgentWorkflow:
                 "prepare",
                 _document_arguments_schema(create=False),
             ),
+            (
+                "websearch.search",
+                "使用搜索引擎搜索信息。用于用户说「搜索」「查找」「查询」等需要联网搜索的请求。支持自动选择最佳搜索引擎。",
+                self._tool_websearch,
+                "local",
+                _websearch_arguments_schema(),
+            ),
+            (
+                "tool_results.read",
+                "按 result_ref 读取本用户此前工具调用的原始结果。",
+                self._tool_result_read,
+                "local",
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["result_ref"],
+                    "properties": {
+                        "result_ref": {
+                            "type": "string",
+                            "pattern": "^tool_result_[a-f0-9]+$",
+                        }
+                    },
+                },
+            ),
         )
         for name, description, handler, category, arguments_schema in definitions:
             registry.register(
@@ -323,17 +395,17 @@ class AgentWorkflow:
     def _try_quick_response(self, text: str, record: DailyRecord | None, date: str) -> str | None:
         """
         快速路径：简单请求直接返回，不走完整ReAct流程。
-        
+
         Args:
             text: 用户输入文本
             record: 当天的计划记录
             date: 日期字符串
-            
+
         Returns:
             快速响应文本，如果需要走完整流程则返回None
         """
         normalized = text.strip().lower()
-        
+
         # 问候和简单对话
         if re.fullmatch(
             r"(你好|您好|嗨|哈喽|hello|hi|在吗|谢谢|感谢|你是谁|"
@@ -348,22 +420,22 @@ class AgentWorkflow:
                 "- 📋 制定和复盘每日计划\n\n"
                 "直接告诉我要做什么即可！"
             )
-        
+
         # 简单的状态查询
         if re.match(r"^(今天|今日)?(有什么|有啥).{0,8}(事|任务|计划|安排)", normalized):
             if record and record.tasks:
                 return format_plan(record)
             else:
                 return f"你在今天（{date}）还没有计划。"
-        
+
         # 简单的感谢回复
         if re.fullmatch(r"(谢谢|感谢|多谢|辛苦了)[！!。.～~\s]*", normalized):
             return "不客气！有什么需要随时叫我。"
-        
+
         # 简单的告别
         if re.fullmatch(r"(再见|拜拜|晚安|goodbye|bye)[！!。.～~\s]*", normalized):
             return "再见！祝你今天愉快。"
-        
+
         # 需要走完整流程的复杂请求
         return None
 
@@ -412,6 +484,123 @@ class AgentWorkflow:
         draft = DocumentOutput.model_validate({"action": "append", **arguments})
         await self._create_document(context.message, context.user_text, draft)
         return ToolResult(status="ok", summary="文档草稿已处理", terminal=True)
+
+    async def _tool_websearch(
+        self,
+        context: AgentContext,
+        arguments: dict[str, Any],
+    ) -> ToolResult:
+        """执行网络搜索"""
+        query = arguments.get("query", "")
+        provider = arguments.get("provider", "auto")
+        max_results = arguments.get("max_results", 5)
+        search_depth = arguments.get("search_depth", "basic")
+        include_answer = arguments.get("include_answer", False)
+
+        if not query:
+            return ToolResult(
+                status="error",
+                summary="搜索查询不能为空",
+                terminal=True,
+            )
+
+        try:
+            results = await self.search_mcp.search(
+                query,
+                provider=provider,
+                max_results=max_results,
+                search_depth=search_depth,
+                include_answer=include_answer,
+            )
+
+            if not results:
+                return ToolResult(
+                    status="ok",
+                    summary="未找到相关结果",
+                )
+
+            raw_result = {
+                "query": query,
+                "provider": provider,
+                "items": [
+                    {
+                        "title": result.title,
+                        "snippet": result.snippet,
+                        "url": result.url,
+                    }
+                    for result in results
+                ],
+            }
+            result_ref = await self.store.save_tool_result(
+                tenant_key=context.message.tenant_key,
+                app_id=context.message.app_id,
+                principal_id=context.message.user_id,
+                tool_name="websearch.search",
+                summary=f"找到 {len(results)} 条与“{query}”相关的结果",
+                payload=raw_result,
+                truncated=len(results) > max_results,
+            )
+            context.metadata.setdefault("retrieved_context", {})[result_ref] = {
+                "summary": f"找到 {len(results)} 条与“{query}”相关的结果",
+                "items": raw_result["items"][:3],
+                "truncated": len(results) > 3,
+            }
+
+            formatted_results = []
+            for i, result in enumerate(results, 1):
+                formatted_results.append(
+                    f"{i}. **{result.title}**\n"
+                    f"   {result.snippet}\n"
+                    f"   [链接]({result.url})"
+                )
+
+            # 构建响应并检查长度限制
+            header = f"搜索结果（{provider}，引用 {result_ref}）：\n\n"
+            max_length = 1900  # 留一些余量
+
+            response_parts = []
+            current_length = len(header)
+
+            for result_text in formatted_results:
+                if current_length + len(result_text) + 2 > max_length:
+                    # 达到长度限制，截断并添加提示
+                    remaining = len(results) - len(response_parts)
+                    response_parts.append(f"\n\n...（还有 {remaining} 条结果未显示）")
+                    break
+                response_parts.append(result_text)
+                current_length += len(result_text) + 2
+
+            response = header + "\n\n".join(response_parts)
+            return ToolResult(
+                status="ok",
+                summary=response,
+            )
+
+        except Exception as e:
+            self.logger.exception("网络搜索工具失败")
+            return ToolResult(
+                status="error",
+                summary=f"搜索失败：{e}",
+            )
+
+    async def _tool_result_read(
+        self,
+        context: AgentContext,
+        arguments: dict[str, Any],
+    ) -> ToolResult:
+        result = await self.store.get_tool_result(
+            str(arguments["result_ref"]),
+            tenant_key=context.message.tenant_key,
+            app_id=context.message.app_id,
+            principal_id=context.message.user_id,
+        )
+        if not result:
+            return ToolResult(status="error", summary="工具结果不存在、已过期或无权访问")
+        serialized = json.dumps(result["payload"], ensure_ascii=False)
+        return ToolResult(
+            status="ok",
+            summary=f"{result['summary']}\n{serialized[:1800]}",
+        )
 
     async def _create_draft(
         self,
@@ -509,12 +698,21 @@ class AgentWorkflow:
             for task in record.tasks
             if task.id in new_task_ids and task.start_time and not task.calendar_event_id
         }
+        self.logger.info(
+            "🧠 计划处理：检查是否需要确认卡片 new_task_ids=%s timed_task_ids=%s "
+            "tasks_with_time=%s encrypt_key_configured=%s",
+            new_task_ids,
+            timed_task_ids,
+            [(t.id, t.title, t.start_time) for t in record.tasks if t.start_time],
+            bool(self.oauth.settings.feishu_encrypt_key),
+        )
         if timed_task_ids:
             if not self.oauth.settings.feishu_encrypt_key:
                 await self.transport.send_markdown(
                     message.chat_id,
                     format_plan(record)
-                    + "\n\n⚠️ 管理员尚未配置安全的飞书卡片回调加密（FEISHU_ENCRYPT_KEY），当前不会执行日历写入。",
+                    + "\n\n⚠️ 管理员尚未配置安全的飞书卡片回调加密"
+                    "（FEISHU_ENCRYPT_KEY），当前不会执行日历写入。",
                 )
                 return
             action = await self.pending_actions.create_calendar_action(
@@ -527,7 +725,17 @@ class AgentWorkflow:
                 format_plan(record),
                 action,
             )
+            self.logger.info(
+                "🧠 计划处理：已发送确认卡片 action_id=%s action_type=%s",
+                action.action_id,
+                action.action_type,
+            )
         else:
+            self.logger.info(
+                "🧠 计划处理：无带时间任务，直接发送文本 new_task_ids=%s all_tasks=%s",
+                new_task_ids,
+                [(t.id, t.title, t.start_time) for t in record.tasks],
+            )
             await self.transport.send_markdown(message.chat_id, format_plan(record))
 
     async def _reminder_status(self, message: IncomingMessage, record: DailyRecord | None) -> None:
@@ -704,75 +912,9 @@ class AgentWorkflow:
         except Exception:
             self.logger.exception("后台状态消息发送失败")
 
-    async def handle_card_action(self, card: Any) -> dict[str, Any]:
-        value = getattr(getattr(card, "action", None), "value", None)
-        actor_open_id = getattr(card, "open_id", "") or ""
-        if not isinstance(value, dict):
-            return _toast("error", "卡片参数无效")
-        action_id = value.get("action_id")
-        payload_hash = value.get("payload_hash")
-        decision = value.get("decision")
-        if not all(isinstance(item, str) and item for item in (action_id, payload_hash, decision)):
-            return _toast("error", "卡片参数不完整")
-        action = await self.store.get_pending_action(action_id)
-        if not action:
-            return _toast("warning", "草稿不存在或已清理")
-        if decision == "cancel":
-            cancelled = await self.store.cancel_pending_action(
-                action_id,
-                actor_open_id=actor_open_id,
-                payload_hash=payload_hash,
-            )
-            if cancelled:
-                await self.audit.record(
-                    "pending_action.confirmation",
-                    "cancelled",
-                    tenant_key=action.tenant_key,
-                    app_id=action.app_id,
-                    principal_id=action.creator_subject_id,
-                    chat_id=action.chat_id,
-                    thread_id=action.thread_id,
-                    action_id=action.action_id,
-                    decision="cancel",
-                    risk_level="high",
-                    payload_hash=action.payload_hash,
-                )
-                await self.transport.send_markdown(
-                    action.chat_id,
-                    "已取消这次外部写入。",
-                )
-                return _toast("success", "已取消")
-            return _toast("warning", "无法取消：不是创建者、已过期或已处理")
-        if decision != "confirm":
-            return _toast("error", "未知操作")
-        claimed = await self.store.claim_pending_action(
-            action_id,
-            actor_open_id=actor_open_id,
-            payload_hash=payload_hash,
-        )
-        if not claimed:
-            return _toast("warning", "无法执行：不是创建者、已过期或已处理")
-        await self.audit.record(
-            "pending_action.confirmation",
-            "confirmed",
-            tenant_key=action.tenant_key,
-            app_id=action.app_id,
-            principal_id=action.creator_subject_id,
-            chat_id=action.chat_id,
-            thread_id=action.thread_id,
-            action_id=action.action_id,
-            decision="confirm",
-            risk_level="high",
-            payload_hash=action.payload_hash,
-        )
-        self.notify_outbox()
-        return _toast("success", "已确认，正在执行")
-
     async def execute_pending_action(self, action: PendingAction) -> None:
         if action.action_type.startswith("document."):
             await self._execute_pending_document(action)
-        elif action.action_type == "calendar.create":
-            await self._execute_pending_calendar(action)
         else:
             await self.store.mark_action_unknown(
                 action.action_id,
@@ -905,122 +1047,10 @@ class AgentWorkflow:
                 ),
             )
 
-    async def _execute_pending_calendar(self, action: PendingAction) -> None:
-        remote_call_started = False
-        try:
-            if not await self.store.claim_action_execution(
-                action.action_id,
-                worker_id=f"card-callback:{id(self)}",
-            ):
-                return
-            record = await self.store.get_record_by_key(str(action.payload["record_key"]))
-            if (
-                not record
-                or record.user_id != action.creator_subject_id
-                or record.updated_at != action.payload.get("record_updated_at")
-            ):
-                await self.store.expire_pending_action(action.action_id)
-                await self.transport.send_markdown(
-                    action.chat_id,
-                    "该确认卡片对应的草稿已变化或不存在，已拒绝执行。请重新提交计划。",
-                )
-                return
-            identity = FeishuIdentity(
-                tenant_key=action.tenant_key,
-                app_id=action.app_id,
-                open_id=action.creator_open_id,
-                union_id=action.creator_subject_id,
-            )
-            token_context = await self.oauth.get_valid_token_context(
-                identity,
-                ("calendar:calendar", "calendar:calendar:readonly"),
-            )
-            if not token_context:
-                await self.store.finish_pending_action(action.action_id, success=False)
-                url = await self.oauth.create_authorization_url(
-                    identity,
-                    action.chat_id,
-                    ("calendar:calendar", "calendar:calendar:readonly"),
-                )
-                await self.transport.send_markdown(
-                    action.chat_id,
-                    f"创建日程需要你本人授权。[点击这里完成授权]({url})，授权后再次点击原卡片。",
-                )
-                return
-            task_ids = {str(item) for item in action.payload.get("task_ids", [])}
-            remote_call_started = True
-            result = await self.openapi.create_events(record, token_context, task_ids)
-            event_ids = dict(result.created)
-            if event_ids:
-                await self.store.record_action_remote_success(
-                    action.action_id,
-                    remote_resource_id=json.dumps(event_ids, sort_keys=True),
-                )
-            for plan_task in record.tasks:
-                if plan_task.id in event_ids:
-                    plan_task.calendar_event_id = event_ids[plan_task.id]
-            record.plan_status = "draft" if result.failed else "confirmed"
-            record.updated_at = datetime.now(UTC).isoformat()
-            await self.store.save_record(record)
-            await self.store.finish_pending_action(action.action_id, success=not result.failed)
-            await self.audit.record(
-                action.action_type,
-                "partial" if result.failed else "success",
-                tenant_key=action.tenant_key,
-                app_id=action.app_id,
-                principal_id=action.creator_subject_id,
-                chat_id=action.chat_id,
-                thread_id=action.thread_id,
-                action_id=action.action_id,
-                risk_level="high",
-                payload_hash=action.payload_hash,
-                metadata={
-                    "created_count": len(result.created),
-                    "failed_count": len(result.failed),
-                },
-            )
-            lines = [f"✅ 已在你本人的日历创建 {len(result.created)} 个提醒（提前 10 分钟）。"]
-            if result.failed:
-                lines.append(
-                    f"创建失败：{'、'.join(item[0] for item in result.failed)}；可再次点击原卡片重试。"
-                )
-            await self.transport.send_markdown(action.chat_id, "\n".join(lines))
-        except Exception as error:
-            if remote_call_started:
-                await self.store.mark_action_unknown(
-                    action.action_id,
-                    error_code="calendar_remote_result_uncertain",
-                    error_message=str(error),
-                )
-            else:
-                await self.store.finish_pending_action(action.action_id, success=False)
-            await self.audit.record(
-                action.action_type,
-                "failure",
-                tenant_key=action.tenant_key,
-                app_id=action.app_id,
-                principal_id=action.creator_subject_id,
-                chat_id=action.chat_id,
-                thread_id=action.thread_id,
-                action_id=action.action_id,
-                risk_level="high",
-                payload_hash=action.payload_hash,
-            )
-            self.logger.exception("执行待确认日历动作失败 action_id=%s", action.action_id)
-            await self.transport.send_markdown(
-                action.chat_id,
-                (
-                    "日历请求的远端结果暂时无法确认，已停止自动重试并进入核对队列。"
-                    if remote_call_started
-                    else "日历创建失败，详细原因已写入日志；该草稿可安全重试。"
-                ),
-            )
-
-
 def _plan_arguments_schema() -> dict[str, Any]:
     nullable_time = {
         "anyOf": [
-            {"type": "string", "pattern": r"^([01]\d|2[0-3]):[0-5]\d$"},
+            {"type": "string", "pattern": r"^([01]?\d|2[0-3]):[0-5]\d$"},
             {"type": "null"},
         ]
     }
@@ -1052,6 +1082,11 @@ def _plan_arguments_schema() -> dict[str, Any]:
                             "enum": ["none", "daily", "weekdays", "weekly"],
                         },
                     },
+                    # 添加提示，帮助模型理解时间格式
+                    "description": (
+                        "任务项。start_time 和 end_time 必须是 HH:MM 格式"
+                        "（如 17:26），不要使用 ISO 时间格式。"
+                    ),
                 },
             }
         },
@@ -1120,13 +1155,49 @@ def _document_arguments_schema(*, create: bool) -> dict[str, Any]:
     }
 
 
+def _websearch_arguments_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["query"],
+        "properties": {
+            "query": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 500,
+                "description": "搜索查询字符串",
+            },
+            "provider": {
+                "type": "string",
+                "enum": ["auto", "searxng", "talordata", "you", "tavily"],
+                "default": "auto",
+                "description": "搜索引擎提供者（auto 自动选择最佳提供者）",
+            },
+            "max_results": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 20,
+                "default": 5,
+                "description": "最大返回结果数",
+            },
+            "search_depth": {
+                "type": "string",
+                "enum": ["basic", "advanced"],
+                "default": "basic",
+                "description": "搜索深度（仅 Tavily 支持）",
+            },
+            "include_answer": {
+                "type": "boolean",
+                "default": False,
+                "description": "是否包含 AI 生成的答案（仅 Tavily 和 TalorData 支持）",
+            },
+        },
+    }
+
+
 def extract_docx_token(text: str) -> str | None:
     match = re.search(r"https?://[^\s)]+/docx/([A-Za-z0-9_-]+)", text)
     return match.group(1) if match else None
-
-
-def _toast(level: str, content: str) -> dict[str, dict[str, str]]:
-    return {"toast": {"type": level, "content": content}}
 
 
 def help_message() -> str:

@@ -1,10 +1,23 @@
+import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import httpx
+import lark_oapi as lark
 import pytest
+from lark_oapi.api.calendar.v4 import CreateCalendarEventRequest
+from lark_oapi.core.enum import AccessTokenType
+from lark_oapi.core.token import verify
 
 from song_agent.config import Settings
+from song_agent.domain.commands import (
+    CalendarDeleteCommand,
+    CalendarUpdateCommand,
+    TaskCreateCommand,
+    TaskQueryCommand,
+    TaskTargetCommand,
+    TaskUpdateCommand,
+)
 from song_agent.feishu.openapi import FeishuOpenApi
 from song_agent.models import DailyRecord, PlanTask, UserTokenContext
 
@@ -49,21 +62,36 @@ def token(subject: str, access_token: str) -> UserTokenContext:
     )
 
 
+def test_sdk_client_is_configured_to_use_explicit_user_tokens() -> None:
+    api = FeishuOpenApi(make_settings())
+    request = (
+        CreateCalendarEventRequest.builder()
+        .calendar_id("primary")
+        .build()
+    )
+    option = (
+        lark.RequestOption.builder()
+        .user_access_token("access-user-a")
+        .build()
+    )
+
+    assert api.client._config.enable_set_token is True
+    verify(api.client._config, request, option)
+    assert request.token_types == {AccessTokenType.USER}
+    assert option.tenant_access_token is None
+
+
 @pytest.mark.asyncio
 async def test_calendar_calls_use_explicit_per_user_token_and_stable_idempotency() -> None:
     captured_tokens: list[str] = []
     idempotency_keys: list[str] = []
     event_counter = 0
 
-    def primary(request, option):
-        captured_tokens.append(option.user_access_token)
-        return SimpleNamespace(
-            success=lambda: True,
-            data=SimpleNamespace(
-                calendars=[SimpleNamespace(calendar=SimpleNamespace(calendar_id="primary"))]
-            ),
-            code=0,
-            msg="",
+    def primary(request: httpx.Request) -> httpx.Response:
+        captured_tokens.append(request.headers["authorization"].removeprefix("Bearer "))
+        return httpx.Response(
+            200,
+            json={"code": 0, "data": {"calendar_id": "primary"}},
         )
 
     def create(request, option):
@@ -73,16 +101,21 @@ async def test_calendar_calls_use_explicit_per_user_token_and_stable_idempotency
         event_counter += 1
         return SimpleNamespace(
             success=lambda: True,
-            data=SimpleNamespace(event=SimpleNamespace(event_id=f"event-{event_counter}")),
+            data=SimpleNamespace(
+                event=SimpleNamespace(
+                    event_id=f"event-{event_counter}",
+                    app_link=f"https://example/event-{event_counter}",
+                )
+            ),
             code=0,
             msg="",
         )
 
     api = FeishuOpenApi(make_settings())
+    api.http_transport = httpx.MockTransport(primary)
     api.client = SimpleNamespace(
         calendar=SimpleNamespace(
             v4=SimpleNamespace(
-                calendar=SimpleNamespace(primary=primary),
                 calendar_event=SimpleNamespace(create=create),
             )
         )
@@ -165,3 +198,103 @@ async def test_document_openapi_uses_explicit_user_token_and_direct_endpoints() 
         request.headers["authorization"] == "Bearer access-user-a"
         for request in requests
     )
+
+
+@pytest.mark.asyncio
+async def test_task_crud_uses_verified_v2_request_shapes() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "POST":
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"task": {"guid": "task-1"}}},
+            )
+        if request.method in {"PATCH", "GET"}:
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"items": [], "task": {"guid": "task-1"}}},
+            )
+        return httpx.Response(200, json={"code": 0, "data": {}})
+
+    api = FeishuOpenApi(make_settings())
+    api.http_transport = httpx.MockTransport(handler)
+    user = token("user-a", "access-user-a")
+    due = datetime(2026, 7, 27, 9, tzinfo=UTC)
+
+    created = await api.create_task(
+        TaskCreateCommand(
+            summary="任务",
+            due_time=due,
+            assignee_open_ids=["open-user-a"],
+            reminder_minutes=[10],
+        ),
+        user,
+        idempotency_key="idempotency",
+    )
+    await api.query_tasks(TaskQueryCommand(completed=False), user)
+    await api.update_task(
+        TaskUpdateCommand(
+            task_guid="task-1",
+            fields={"summary": "新任务"},
+        ),
+        user,
+    )
+    await api.complete_task(TaskTargetCommand(task_guid="task-1"), user)
+    deleted = await api.delete_task(TaskTargetCommand(task_guid="task-1"), user)
+
+    create_body = json.loads(requests[0].content)
+    patch_bodies = [
+        json.loads(item.content) for item in requests if item.method == "PATCH"
+    ]
+    assert created["task_guid"] == "task-1"
+    assert create_body["due"]["timestamp"] == str(int(due.timestamp() * 1000))
+    assert create_body["members"][0] == {
+        "id": "open-user-a",
+        "type": "user",
+        "role": "assignee",
+    }
+    assert patch_bodies[0] == {
+        "task": {"summary": "新任务"},
+        "update_fields": ["summary"],
+    }
+    assert patch_bodies[1]["update_fields"] == ["completed_at"]
+    assert deleted == {"task_guid": "task-1", "deleted": True}
+    assert all(
+        item.headers["authorization"] == "Bearer access-user-a"
+        for item in requests
+    )
+
+
+@pytest.mark.asyncio
+async def test_calendar_update_and_delete_use_primary_user_calendar() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/calendars/primary"):
+            return httpx.Response(
+                200,
+                json={"code": 0, "data": {"calendar_id": "primary"}},
+            )
+        return httpx.Response(200, json={"code": 0, "data": {}})
+
+    api = FeishuOpenApi(make_settings())
+    api.http_transport = httpx.MockTransport(handler)
+    user = token("user-a", "access-user-a")
+    updated = await api.update_calendar(
+        CalendarUpdateCommand(event_id="event_123", summary="新标题"),
+        user,
+    )
+    deleted = await api.delete_calendar(
+        CalendarDeleteCommand(event_id="event_123"),
+        user,
+    )
+
+    assert updated == {}
+    assert deleted["deleted"] is True
+    assert requests[1].method == "PATCH"
+    assert requests[1].url.path.endswith("/events/event_123")
+    assert json.loads(requests[1].content)["summary"] == "新标题"
+    assert requests[2].method == "DELETE"

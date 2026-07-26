@@ -14,7 +14,7 @@ from ..config import Settings
 from ..policies.tool_policy import ToolPolicyGuard
 from .budget import AgentRunBudget, BudgetExceededError
 from .context import AgentContext
-from .context_builder import ContextBuilder, ContextConfig
+from .context_builder import AgentContextBuilder, ContextConfig
 from .models import AgentDecision, AgentResult, ToolResult
 from .tool_registry import ToolRegistry
 
@@ -63,7 +63,7 @@ class ReActRuntime:
         self.logger = logging.getLogger(__name__)
 
         # 上下文构建器
-        self.context_builder = ContextBuilder(ContextConfig())
+        self.context_builder = AgentContextBuilder(ContextConfig())
 
     async def run(self, context: AgentContext) -> AgentResult:
         """
@@ -310,7 +310,7 @@ class ReActRuntime:
             tool_schema_count=len(tool_schemas),
         )
 
-        return decision
+        return _normalize_tool_decision(context, decision, tool_schemas)
 
     def _infer_capabilities(
         self,
@@ -335,13 +335,26 @@ class ReActRuntime:
         if any(kw in user_text for kw in ["计划", "规划", "安排", "待办", "todo"]):
             capabilities.add("plans")
 
-        if any(kw in user_text for kw in ["日历", "日程", "会议", "calendar"]):
-            capabilities.add("calendar")
-
         if any(kw in user_text for kw in ["文档", "记录", "document"]):
             capabilities.add("documents")
 
-        if any(kw in user_text for kw in ["搜索", "查找", "search"]):
+        if any(
+            kw in user_text
+            for kw in [
+                "搜索",
+                "查找",
+                "search",
+                "查询",
+                "检索",
+                "天气",
+                "气温",
+                "下雨",
+                "降雨",
+                "空气质量",
+                "weather",
+                "forecast",
+            ]
+        ):
             capabilities.add("websearch")
 
         if any(kw in user_text for kw in ["偏好", "设置", "preference"]):
@@ -350,12 +363,12 @@ class ReActRuntime:
         # 根据观察推断
         for obs in observations:
             tool = obs.get("tool", "")
-            if "calendar" in tool:
-                capabilities.add("calendar")
-            elif "plan" in tool:
+            if "plan" in tool:
                 capabilities.add("plans")
             elif "document" in tool:
                 capabilities.add("documents")
+            elif "websearch" in tool:
+                capabilities.add("websearch")
 
         # 如果没有推断出任何能力，添加基础能力
         if not capabilities:
@@ -550,6 +563,11 @@ class ReActRuntime:
                 _system_prompt(self.tools),
                 _user_prompt(context, observations),
             )
+            decision = _normalize_tool_decision(
+                context,
+                decision,
+                self.tools.schemas(),
+            )
             if self.recorder is not None:
                 await self.recorder.record_decision(context, step_index, decision)
             if decision.type == "final_answer":
@@ -689,3 +707,32 @@ def _failed(step_count: int, tool_calls: int, code: str) -> AgentResult:
         tool_call_count=tool_calls,
         error_code=code,
     )
+
+
+def _normalize_tool_decision(
+    context: AgentContext,
+    decision: AgentDecision,
+    tool_schemas: list[dict],
+) -> AgentDecision:
+    if decision.type != "tool_call":
+        return decision
+    visible_tools = {str(schema.get("name") or "") for schema in tool_schemas}
+    if decision.tool_name in visible_tools:
+        return decision
+    weather_terms = ("天气", "气温", "下雨", "降雨", "空气质量", "weather", "forecast")
+    if (
+        "websearch.search" in visible_tools
+        and any(term in context.user_text.lower() for term in weather_terms)
+    ):
+        return decision.model_copy(
+            update={
+                "tool_name": "websearch.search",
+                "arguments": {
+                    "query": context.user_text,
+                    "provider": "auto",
+                    "max_results": 5,
+                },
+                "decision_summary": "搜索天气信息",
+            }
+        )
+    return decision

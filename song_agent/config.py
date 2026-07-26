@@ -39,6 +39,12 @@ class Settings(BaseSettings):
     feishu_verification_token: str = ""
     feishu_encrypt_key: str = ""
 
+    # Search Engine MCP API Keys
+    searxng_base_url: str = ""
+    talordata_api_key: str = ""
+    ydc_api_key: str = ""
+    tavily_api_key: str = ""
+
     public_base_url: HttpUrl = HttpUrl("http://127.0.0.1:45837")
     port: int = Field(default=45837, ge=1, le=65535)
     timezone: str = "Asia/Shanghai"
@@ -49,7 +55,7 @@ class Settings(BaseSettings):
 
     # LLM 超时配置（细粒度）
     llm_connect_timeout_seconds: float = Field(default=10.0, ge=1.0, le=30.0)
-    llm_read_timeout_seconds: float = Field(default=75.0, ge=10.0, le=180.0)
+    llm_read_timeout_seconds: float = Field(default=60.0, ge=10.0, le=180.0)
     llm_write_timeout_seconds: float = Field(default=15.0, ge=5.0, le=60.0)
     llm_pool_timeout_seconds: float = Field(default=5.0, ge=1.0, le=30.0)
 
@@ -62,8 +68,10 @@ class Settings(BaseSettings):
     llm_document_max_tokens: int = Field(default=12000, ge=1000, le=16000)
 
     # Agent 运行预算
+    # 注意：agent_step_timeout 必须大于 llm_read_timeout * (1 + llm_max_retries)
+    # 当前：150s > 60s * 2 = 120s，留有 30s 缓冲
     agent_run_timeout_seconds: int = Field(default=150, ge=30, le=600)
-    agent_step_timeout_seconds: int = Field(default=85, ge=20, le=120)
+    agent_step_timeout_seconds: int = Field(default=150, ge=20, le=180)
     agent_tool_timeout_seconds: int = Field(default=30, ge=10, le=60)
 
     # Agent 请求预算
@@ -126,6 +134,10 @@ class Settings(BaseSettings):
         return (
             "calendar:calendar",
             "calendar:calendar:readonly",
+            "calendar:calendar.event:create",
+            "calendar:calendar.event:read",
+            "task:task:read",
+            "task:task:write",
             "docx:document",
             "drive:drive",
             "search:docs:read",

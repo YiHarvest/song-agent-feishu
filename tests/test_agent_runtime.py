@@ -4,7 +4,7 @@ from typing import Any
 import pytest
 
 from song_agent.agent.context import AgentContext
-from song_agent.agent.context_builder import ContextBuilder
+from song_agent.agent.context_builder import AgentContextBuilder
 from song_agent.agent.models import AgentDecision, ToolResult
 from song_agent.agent.runtime import AgentLimits, ReActRuntime
 from song_agent.agent.tool_registry import AgentTool, ToolRegistry
@@ -81,7 +81,7 @@ def test_settings_accepts_configured_fifteen_tool_calls() -> None:
 
 
 def test_context_builder_preserves_runtime_tool_summary() -> None:
-    summary = ContextBuilder().build_tool_result_summary(
+    summary = AgentContextBuilder().build_tool_result_summary(
         [
             {
                 "tool": "plans.save_draft",
@@ -187,6 +187,58 @@ async def test_runtime_rejects_repeated_identical_tool_call() -> None:
     assert result.error_code == "repeated_tool_call"
 
 
+@pytest.mark.asyncio
+async def test_weather_alias_uses_visible_websearch_tool() -> None:
+    calls = []
+
+    async def handler(ctx: AgentContext, arguments: dict[str, Any]) -> ToolResult:
+        calls.append(arguments)
+        return ToolResult(status="ok", summary="杭州萧山晴，30℃")
+
+    registry = ToolRegistry()
+    registry.register(
+        AgentTool(
+            name="websearch.search",
+            description="search web",
+            handler=handler,
+            category="local",
+            arguments_schema={
+                "type": "object",
+                "required": ["query"],
+                "properties": {"query": {"type": "string"}},
+            },
+        )
+    )
+    agent = ReActRuntime(
+        FakeLlm(
+            [
+                AgentDecision(
+                    type="tool_call",
+                    tool_name="get_weather",
+                    arguments={"location": "杭州萧山"},
+                ),
+                AgentDecision(type="final_answer", content="杭州萧山晴，30℃"),
+            ]
+        ),
+        registry,
+        ToolPolicyGuard(),
+        AgentLimits(max_steps=3, max_tool_calls=2, timeout_seconds=5),
+    )
+    ctx = context()
+    ctx.user_text = "今天杭州萧山天气怎么样？"
+
+    result = await agent.run(ctx)
+
+    assert result.status == "completed"
+    assert calls == [
+        {
+            "query": "今天杭州萧山天气怎么样？",
+            "provider": "auto",
+            "max_results": 5,
+        }
+    ]
+
+
 def test_registry_rejects_llm_visible_commit_tools() -> None:
     async def handler(ctx: AgentContext, arguments: dict[str, Any]) -> ToolResult:
         del ctx, arguments
@@ -237,6 +289,37 @@ def test_planning_phrase_selects_plan_tool_schema() -> None:
         "plans.save_draft",
         "reviews.save",
     }
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "10分钟后提醒我交PR",
+        "帮我设个闹钟",
+        "明天上午9点定时提醒我开会",
+        "到点提醒我喝水",
+        "remind me to submit the PR in 10 minutes",
+    ],
+)
+def test_reminder_phrase_does_not_expose_calendar_react_tool(phrase: str) -> None:
+    """确定性日历意图不能进入 ReAct 工具路径。"""
+    workflow = object.__new__(AgentWorkflow)
+    registry = workflow._build_tool_registry()
+    agent = ReActRuntime(
+        FakeLlm([]),
+        registry,
+        ToolPolicyGuard(),
+        AgentLimits(),
+    )
+    ctx = context()
+    ctx.user_text = phrase
+
+    capabilities = agent._infer_capabilities(ctx, [])
+    schemas = registry.schemas_for(ctx, capabilities)
+
+    assert "calendar" not in capabilities
+    schema_names = {schema["name"] for schema in schemas}
+    assert "calendar.prepare_create_event" not in schema_names
 
 
 @pytest.mark.asyncio

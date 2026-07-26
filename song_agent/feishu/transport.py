@@ -21,7 +21,7 @@ from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody, 
 from lark_oapi.ws import Client as WsClient
 
 from ..config import Settings
-from ..feishu.cards import calendar_confirmation_card, document_confirmation_card
+from ..feishu.cards import business_confirmation_card, document_confirmation_card
 from ..models import IncomingMessage, PendingAction
 from ..store import SqliteStore
 
@@ -73,11 +73,9 @@ class FeishuTransport:
         self.logger.info("📤 管家返回消息 chat=%s content=%r", chat_id, markdown)
         card = {
             "schema": "2.0",
-            "config": {"update_multi": True},
+            "config": {"wide_screen_mode": True},
             "body": {
-                "direction": "vertical",
-                "padding": "12px 12px 12px 12px",
-                "elements": [{"tag": "markdown", "content": markdown, "text_align": "left"}],
+                "elements": [{"tag": "markdown", "content": markdown}],
             },
         }
         return await self.send_card(chat_id, card)
@@ -91,9 +89,12 @@ class FeishuTransport:
         card = (
             document_confirmation_card(markdown, action)
             if action.action_type.startswith("document.")
-            else calendar_confirmation_card(markdown, action)
+            else business_confirmation_card(markdown, action)
         )
-        return await self.send_card(chat_id, card)
+        message_id = await self.send_card(chat_id, card)
+        if message_id:
+            await self.store.set_pending_action_card_message(action.action_id, message_id)
+        return message_id
 
     async def send_card(self, chat_id: str, card: dict[str, Any]) -> str | None:
         body = (

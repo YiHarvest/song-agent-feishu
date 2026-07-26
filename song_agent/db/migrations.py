@@ -33,6 +33,8 @@ async def run_migrations(
         ("0006_scheduled_jobs_v2", _scheduled_jobs_v2),
         ("0007_agent_history", _agent_history),
         ("0008_oauth_original_request", _oauth_original_request),
+        ("0009_business_pending_actions", _business_pending_actions),
+        ("0010_context_memory", _context_memory),
     )
     for migration_id, migration in migrations:
         cursor = await db.execute(
@@ -244,42 +246,45 @@ async def _reliable_pending_actions(
             "CREATE INDEX IF NOT EXISTS idx_pending_actions_expiry "
             "ON pending_actions(status, expires_at)"
         )
-    await db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS action_attempts (
-            attempt_id TEXT PRIMARY KEY,
-            action_id TEXT NOT NULL,
-            attempt_number INTEGER NOT NULL,
-            started_at INTEGER NOT NULL,
-            completed_at INTEGER,
-            status TEXT NOT NULL,
-            request_fingerprint TEXT NOT NULL,
-            remote_request_id TEXT NOT NULL DEFAULT '',
-            remote_resource_id TEXT NOT NULL DEFAULT '',
-            error_code TEXT NOT NULL DEFAULT '',
-            error_message TEXT NOT NULL DEFAULT '',
-            FOREIGN KEY(action_id) REFERENCES pending_actions(action_id)
+        # pending_actions 已原地迁移，重建关联执行表。
+        await db.execute("DROP TABLE IF EXISTS action_attempts")
+        await db.execute("DROP TABLE IF EXISTS action_outbox")
+        await db.execute(
+            """
+            CREATE TABLE action_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                action_id TEXT NOT NULL,
+                attempt_number INTEGER NOT NULL,
+                started_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                status TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                remote_request_id TEXT NOT NULL DEFAULT '',
+                remote_resource_id TEXT NOT NULL DEFAULT '',
+                error_code TEXT NOT NULL DEFAULT '',
+                error_message TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY(action_id) REFERENCES pending_actions(action_id)
+            )
+            """
         )
-        """
-    )
-    await db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS action_outbox (
-            outbox_id TEXT PRIMARY KEY,
-            action_id TEXT NOT NULL,
-            event_type TEXT NOT NULL,
-            payload_json TEXT NOT NULL,
-            status TEXT NOT NULL,
-            available_at INTEGER NOT NULL,
-            claimed_by TEXT,
-            claim_expires_at INTEGER,
-            attempt_count INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL,
-            processed_at INTEGER,
-            FOREIGN KEY(action_id) REFERENCES pending_actions(action_id)
+        await db.execute(
+            """
+            CREATE TABLE action_outbox (
+                outbox_id TEXT PRIMARY KEY,
+                action_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                available_at INTEGER NOT NULL,
+                claimed_by TEXT,
+                claim_expires_at INTEGER,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                processed_at INTEGER,
+                FOREIGN KEY(action_id) REFERENCES pending_actions(action_id)
+            )
+            """
         )
-        """
-    )
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_action_outbox_ready "
         "ON action_outbox(status, available_at)"
@@ -488,6 +493,117 @@ async def _oauth_original_request(
         await db.execute(
             "ALTER TABLE oauth_authorizations ADD COLUMN original_request TEXT NOT NULL DEFAULT ''"
         )
+
+
+async def _business_pending_actions(
+    db: aiosqlite.Connection,
+    cipher: AesGcmTokenCipher,
+) -> None:
+    """增加业务动作字段并原地迁移旧数据。"""
+
+    del cipher
+    columns = await _columns(db, "pending_actions")
+    additions = {
+        "payload_version": "INTEGER NOT NULL DEFAULT 1",
+        "idempotency_key": "TEXT NOT NULL DEFAULT ''",
+        "source": "TEXT NOT NULL DEFAULT 'legacy_agent'",
+        "source_card_message_id": "TEXT NOT NULL DEFAULT ''",
+        "result_json": "TEXT NOT NULL DEFAULT '{}'",
+        "updated_at": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for name, definition in additions.items():
+        if name not in columns:
+            await db.execute(f"ALTER TABLE pending_actions ADD COLUMN {name} {definition}")
+    await db.execute(
+        """
+        UPDATE pending_actions
+        SET payload_version = 1,
+            source = CASE WHEN source = '' THEN 'legacy_agent' ELSE source END,
+            updated_at = CASE WHEN updated_at = 0 THEN created_at ELSE updated_at END
+        """
+    )
+    await db.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_actions_idempotency
+        ON pending_actions(tenant_key, app_id, idempotency_key)
+        WHERE idempotency_key != ''
+        """
+    )
+
+
+async def _context_memory(
+    db: aiosqlite.Connection,
+    cipher: AesGcmTokenCipher,
+) -> None:
+    """增加分层会话、摘要、长期记忆和工具结果存储。"""
+
+    del cipher
+    statements = """
+        CREATE TABLE IF NOT EXISTS conversation_messages (
+            row_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            tenant_key TEXT NOT NULL,
+            app_id TEXT NOT NULL,
+            principal_id TEXT NOT NULL,
+            chat_id TEXT NOT NULL DEFAULT '',
+            thread_id TEXT NOT NULL DEFAULT '',
+            message_id TEXT NOT NULL,
+            role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'tool', 'system')),
+            content TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            summarized_at INTEGER,
+            UNIQUE (tenant_key, app_id, principal_id, message_id)
+        );
+        CREATE TABLE IF NOT EXISTS conversation_summaries (
+            summary_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            tenant_key TEXT NOT NULL,
+            app_id TEXT NOT NULL,
+            principal_id TEXT NOT NULL,
+            summary_json TEXT NOT NULL,
+            covered_message_count INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            UNIQUE (tenant_key, app_id, principal_id, session_id)
+        );
+        CREATE TABLE IF NOT EXISTS user_memories (
+            memory_id TEXT PRIMARY KEY,
+            tenant_key TEXT NOT NULL,
+            app_id TEXT NOT NULL,
+            principal_id TEXT NOT NULL,
+            memory_type TEXT NOT NULL,
+            memory_key TEXT NOT NULL,
+            memory_value TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            source_message_id TEXT NOT NULL DEFAULT '',
+            valid_from TEXT NOT NULL,
+            valid_until TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (tenant_key, app_id, principal_id, memory_type, memory_key)
+        );
+        CREATE TABLE IF NOT EXISTS tool_results (
+            result_ref TEXT PRIMARY KEY,
+            tenant_key TEXT NOT NULL,
+            app_id TEXT NOT NULL,
+            principal_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            truncated INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_conversation_messages_recent
+        ON conversation_messages(
+            tenant_key, app_id, principal_id, session_id, created_at
+        );
+        CREATE INDEX IF NOT EXISTS idx_user_memories_principal
+        ON user_memories(tenant_key, app_id, principal_id, updated_at);
+        """
+    for statement in statements.split(";"):
+        if statement.strip():
+            await db.execute(statement)
 
 
 async def _columns(db: aiosqlite.Connection, table: str) -> set[str]:

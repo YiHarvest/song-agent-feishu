@@ -46,6 +46,50 @@ class PendingActionService:
         await self.store.save_pending_action(action)
         return action
 
+    async def create_action(
+        self,
+        message: IncomingMessage,
+        *,
+        action_type: str,
+        payload: dict,
+        idempotency_key: str,
+        source: str,
+    ) -> PendingAction:
+        existing = await self.store.get_pending_action_by_idempotency(
+            tenant_key=message.tenant_key,
+            app_id=message.app_id,
+            idempotency_key=idempotency_key,
+        )
+        if existing:
+            return existing
+        now = int(time.time())
+        action = PendingAction(
+            action_id=str(uuid.uuid4()),
+            tenant_key=message.tenant_key,
+            app_id=message.app_id,
+            chat_id=message.chat_id,
+            thread_id=message.thread_id or message.root_id,
+            creator_subject_id=message.user_id,
+            creator_open_id=message.open_id or message.user_id,
+            action_type=action_type,
+            payload=payload,
+            payload_hash=payload_hash(payload),
+            source_message_id=message.message_id,
+            expires_at=now + self.ttl_seconds,
+            created_at=now,
+            idempotency_key=idempotency_key,
+            source=source,
+        )
+        await self.store.save_pending_action(action)
+        return (
+            await self.store.get_pending_action_by_idempotency(
+                tenant_key=message.tenant_key,
+                app_id=message.app_id,
+                idempotency_key=idempotency_key,
+            )
+            or action
+        )
+
     async def create_document_action(
         self,
         message: IncomingMessage,

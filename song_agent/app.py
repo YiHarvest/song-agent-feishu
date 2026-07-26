@@ -9,22 +9,61 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 
 import lark_oapi as lark
 from fastapi import FastAPI, Request, Response
+from lark_oapi.core.const import (
+    LARK_REQUEST_NONCE,
+    LARK_REQUEST_SIGNATURE,
+    LARK_REQUEST_TIMESTAMP,
+    X_REQUEST_ID,
+    X_TT_LOGID,
+)
 from lark_oapi.core.model import RawRequest
 
+from .api import calendar as calendar_api
+from .api import chat as chat_api
+from .api import events as events_api
+from .api import pending_actions as pending_actions_api
+from .api import reminders as reminders_api
+from .api import tasks as tasks_api
+from .application.calendar_service import CalendarApplicationService
+from .application.pending_action_service import PendingActionApplicationService
+from .application.reminder_service import ReminderApplicationService
+from .application.request_router import RequestRouter
+from .application.task_service import TaskApplicationService
 from .config import Settings
+from .context.builders import AgentRuntimeContextBuilder, BusinessContextBuilder
+from .context.service import ConversationContextService
+from .executors.calendar_executor import CalendarCreateExecutor
+from .executors.calendar_mutation_executor import (
+    CalendarDeleteExecutor,
+    CalendarUpdateExecutor,
+    ReminderCancelExecutor,
+)
+from .executors.registry import ExecutorRegistry
+from .executors.reminder_executor import ReminderCreateExecutor
+from .executors.task_executor import (
+    TaskCompleteExecutor,
+    TaskCreateExecutor,
+    TaskDeleteExecutor,
+    TaskUpdateExecutor,
+)
+from .feishu.callbacks import FeishuCardCallbacks
 from .feishu.mcp import FeishuMcp
 from .feishu.oauth import FeishuOAuth
 from .feishu.openapi import FeishuOpenApi
 from .feishu.transport import FeishuTransport
+from .intelligence.general_agent import GeneralAgent
+from .intelligence.intent_extractor import IntentExtractor
 from .llm import StructuredLlm
-from .models import IncomingMessage
+from .models import FeishuIdentity, IncomingMessage
 from .observability.context import trace_scope
 from .planner import Planner
 from .scheduler import start_scheduler
+from .search.mcp import SearchMcp
 from .services.audit import AuditService
 from .services.encryption import AesGcmTokenCipher
 from .services.outbox import ActionOutboxWorker
@@ -32,6 +71,22 @@ from .services.pending_actions import PendingActionService
 from .services.reconciliation import ActionReconciliationService
 from .store import SqliteStore
 from .workflow import AgentWorkflow
+
+
+def _lark_sdk_headers(headers: Mapping[str, str]) -> dict[str, str]:
+    """Restore canonical names expected by lark-oapi's case-sensitive lookup."""
+    result = dict(headers)
+    lower_headers = {name.lower(): value for name, value in headers.items()}
+    for name in (
+        LARK_REQUEST_TIMESTAMP,
+        LARK_REQUEST_NONCE,
+        LARK_REQUEST_SIGNATURE,
+        X_REQUEST_ID,
+        X_TT_LOGID,
+    ):
+        if value := lower_headers.get(name.lower()):
+            result[name] = value
+    return result
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -84,8 +139,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         transport = FeishuTransport(config, store)
         await transport.initialize()
-        planner = Planner(StructuredLlm(config), config.timezone)
+        structured_llm = StructuredLlm(config)
+        planner = Planner(structured_llm, config.timezone)
         mcp = FeishuMcp(config)
+        search_mcp = SearchMcp(config)
         openapi = FeishuOpenApi(config)
         pending_actions = PendingActionService(
             store,
@@ -99,18 +156,70 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             oauth,
             openapi,
             mcp,
+            search_mcp,
             pending_actions,
             audit,
         )
+        pending_action_service = PendingActionApplicationService(store, audit)
+        calendar_service = CalendarApplicationService(
+            oauth,
+            pending_actions,
+            openapi,
+            default_timezone=config.timezone,
+        )
+        task_service = TaskApplicationService(oauth, pending_actions, openapi)
+        reminder_service = ReminderApplicationService(calendar_service)
+        business_contexts = BusinessContextBuilder(
+            store,
+            timezone=config.timezone,
+        )
+        conversation_contexts = ConversationContextService(
+            store,
+            structured_llm,
+            business_contexts,
+        )
+        agent_contexts = AgentRuntimeContextBuilder()
+        request_router = RequestRouter(
+            IntentExtractor(structured_llm, config.timezone),
+            calendar_service,
+            task_service,
+            reminder_service,
+            pending_action_service,
+            GeneralAgent(workflow.handle_general_request),
+            business_contexts,
+            conversation_contexts,
+            agent_contexts,
+        )
+        workflow.set_request_router(request_router)
+        executors = ExecutorRegistry(legacy_handler=workflow.execute_pending_action)
+        executors.register(
+            CalendarCreateExecutor(store, oauth, openapi, audit, transport)
+        )
+        for executor_type in (
+            CalendarUpdateExecutor,
+            CalendarDeleteExecutor,
+            ReminderCreateExecutor,
+            ReminderCancelExecutor,
+            TaskCreateExecutor,
+            TaskUpdateExecutor,
+            TaskCompleteExecutor,
+            TaskDeleteExecutor,
+        ):
+            executors.register(executor_type(store, oauth, openapi, audit, transport))
         reconciliation = ActionReconciliationService(store, audit)
         outbox = ActionOutboxWorker(
             store,
-            workflow.execute_pending_action,
+            executors.execute,
             reconciliation.reconcile,
         )
         workflow.notify_outbox = outbox.notify
+        pending_action_service.set_outbox_notifier(outbox.notify)
         
-        async def handle_oauth_authorized(chat_id: str, original_request: str) -> None:
+        async def handle_oauth_authorized(
+            identity: FeishuIdentity,
+            chat_id: str,
+            original_request: str,
+        ) -> None:
             """OAuth授权完成后的回调处理"""
             if original_request:
                 # 有原始请求，自动继续处理
@@ -123,12 +232,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     IncomingMessage(
                         message_id=f"oauth_resume_{int(time.time())}",
                         event_id=f"oauth_resume_{int(time.time())}",
-                        tenant_key="",
-                        app_id=config.feishu_app_id,
-                        user_id="",
-                        open_id="",
-                        tenant_user_id="",
-                        union_id="",
+                        tenant_key=identity.tenant_key,
+                        app_id=identity.app_id,
+                        user_id=identity.subject_id,
+                        open_id=identity.open_id,
+                        tenant_user_id=identity.user_id,
+                        union_id=identity.union_id,
                         chat_id=chat_id,
                         thread_id="",
                         root_id="",
@@ -149,15 +258,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         scheduler = await start_scheduler(config, store, transport)
         outbox.start()
         app.state.store = store
+        app.state.settings = config
         app.state.transport = transport
         app.state.oauth = oauth
         app.state.workflow = workflow
         app.state.outbox = outbox
+        app.state.calendar_service = calendar_service
+        app.state.task_service = task_service
+        app.state.reminder_service = reminder_service
+        app.state.business_contexts = business_contexts
+        app.state.conversation_contexts = conversation_contexts
+        app.state.pending_action_service = pending_action_service
+        app.state.request_router = request_router
+        card_callbacks = FeishuCardCallbacks(
+            pending_action_service,
+            asyncio.get_running_loop(),
+        )
+        app.state.card_handler = (
+            lark.EventDispatcherHandler.builder(
+                config.feishu_encrypt_key,
+                config.feishu_verification_token,
+            )
+            .register_p2_card_action_trigger(card_callbacks.handle)
+            .build()
+        )
         app.state.loop = asyncio.get_running_loop()
         if not config.feishu_encrypt_key:
             logging.getLogger(__name__).warning(
                 "FEISHU_ENCRYPT_KEY 未配置：敏感操作确认卡片暂不可执行"
             )
+        logging.getLogger(__name__).info(
+            "飞书卡片回调已配置 callback_url=%s/feishu/card/action "
+            "encrypt_key_configured=%s",
+            config.base_url,
+            bool(config.feishu_encrypt_key),
+        )
         logging.getLogger(__name__).info("FastAPI 服务已启动: %s", config.base_url)
         try:
             yield
@@ -169,6 +304,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="Song Agent", version="0.3.0", lifespan=lifespan)
     app.include_router(oauth.router)
+    app.include_router(chat_api.router)
+    app.include_router(calendar_api.router)
+    app.include_router(pending_actions_api.router)
+    app.include_router(events_api.router)
+    app.include_router(tasks_api.router)
+    app.include_router(reminders_api.router)
 
     @app.middleware("http")
     async def trace_http_request(request: Request, call_next):
@@ -177,35 +318,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             response.headers["X-Trace-ID"] = trace_id
             return response
 
-    def process_card_action(card: lark.Card):
-        loop = getattr(app.state, "loop", None)
-        workflow = getattr(app.state, "workflow", None)
-        if loop is None or workflow is None:
-            raise RuntimeError("Song Agent 尚未完成启动")
-        future = asyncio.run_coroutine_threadsafe(workflow.handle_card_action(card), loop)
-        return future.result(timeout=5)
-
-    # 飞书卡片回调安全说明（依据飞书官方文档）：
-    # 卡片回调请求不携带 X-Lark-Request-Timestamp / X-Lark-Request-Nonce / X-Lark-Signature
-    # 这些签名头仅出现在「事件订阅」的 HTTP 回调中。卡片回调的安全验证依赖 encrypt_key
-    # 对请求体进行 AES 解密完成，而非签名验证。
-    #
-    # lark_oapi 的 CardActionHandler._verify_sign 错误地使用 verification_token 进行签名
-    # 校验，但卡片回调请求中没有 timestamp/nonce 头，会导致 NoneType 拼接异常。
-    # 因此这里不传入 verification_token，使其跳过签名验证，仅依赖 encrypt_key 解密保护。
-    # 若未配置 encrypt_key，则卡片回调端点返回 503。
-    card_handler = (
-        lark.CardActionHandler.builder(
-            config.feishu_encrypt_key,
-            "",  # 不传入 verification_token，避免触发错误的签名验证逻辑
-        )
-        .register(process_card_action)
-        .build()
-    )
-
     @app.post("/feishu/card/action")
     async def card_action(request: Request) -> Response:
+        started_at = time.monotonic()
+        logger = logging.getLogger(__name__)
         if not config.feishu_encrypt_key:
+            logger.error(
+                "拒绝卡片回调 reason=encrypt_key_not_configured path=%s",
+                request.url.path,
+            )
             return Response(
                 content='{"msg":"card callback encryption is not configured"}',
                 status_code=503,
@@ -213,18 +334,50 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         raw = RawRequest()
         raw.uri = request.url.path
-        raw.headers = dict(request.headers)  # type: ignore[assignment]
+        raw.headers = _lark_sdk_headers(request.headers)
         raw.body = await request.body()
+        request_id = (
+            request.headers.get("x-request-id")
+            or request.headers.get("x-tt-logid")
+            or request.headers.get("x-lark-request-id")
+            or ""
+        )
+        logger.info(
+            "收到飞书卡片回调 path=%s request_id=%s content_type=%s "
+            "content_length=%s body_bytes=%d client=%s",
+            request.url.path,
+            request_id,
+            request.headers.get("content-type", ""),
+            request.headers.get("content-length", ""),
+            len(raw.body),
+            request.client.host if request.client else "",
+        )
 
         try:
+            card_handler = app.state.card_handler
             result = await asyncio.to_thread(card_handler.do, raw)
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            log = logger.info if result.status_code < 400 else logger.error
+            log(
+                "飞书卡片回调完成 request_id=%s status_code=%s "
+                "response_bytes=%d duration_ms=%d",
+                request_id,
+                result.status_code,
+                len(result.content or b""),
+                duration_ms,
+            )
             return Response(
                 content=result.content,
                 status_code=result.status_code,
                 media_type="application/json",
             )
         except Exception:
-            logging.getLogger(__name__).exception("卡片回调处理失败")
+            logger.exception(
+                "卡片回调处理失败 request_id=%s body_bytes=%d duration_ms=%d",
+                request_id,
+                len(raw.body),
+                int((time.monotonic() - started_at) * 1000),
+            )
             return Response(
                 content='{"msg":"internal error"}',
                 status_code=500,

@@ -1,20 +1,33 @@
-# Song Agent 2.0：ReAct 多用户飞书个人管家
+# Song Agent：确定性业务执行 + 开放式 Agent
 
-Song Agent 2.0 是 Python + FastAPI 实现的多用户飞书智能体。自然语言请求进入有限步数 ReAct Runtime，由 Tool Registry 和 Policy Guard 控制工具选择；所有用户级飞书调用显式携带当前用户的 `UserTokenContext`。
+Song Agent 是 Python、FastAPI 与 React 实现的多用户飞书工作台。自然语言先经过一次结构化意图提取；日历等确定性业务进入应用服务、PendingAction、Outbox 和 Executor，开放式对话才进入有限步数 ReAct Runtime。
+
+## 核心功能
+
+- 📅 **日程管理**：查询、创建、修改和删除个人日程
+- ✅ **任务与提醒**：飞书任务 CRUD；提醒作为带来源标记的个人日程管理
+- 📋 **每日计划**：制定和复盘每日任务，支持优先级和时间安排
+- 📝 **文档协作**：创建和编辑飞书云文档
+- 🔍 **网络搜索**：集成 You.com 和 Tavily 搜索引擎，支持实时信息查询
+- 🔐 **安全可控**：OAuth 2.0 多用户隔离，敏感操作需要确认
+- 🤖 **智能对话**：普通对话和开放分析使用 ReAct
 
 ## 核心安全边界
 
 - 身份和会话按 tenant/app/chat/thread/principal 隔离。
 - OAuth access/refresh token 使用 AES-256-GCM 加密后存入 SQLite，数据库启用 WAL。
 - `UserTokenContext` 只含短生命周期 access token，不含 refresh token。
-- LLM 只能看到 read/local/prepare 工具，不能看到任何 `commit_*` 内部执行方法。
-- 日历和文档写操作先创建持久化 Pending Action，再由创建者点击飞书卡片确认。
-- 卡片只携带 `action_id` 和 `payload_hash`；完整业务参数以数据库为准。
+- LLM 只提取意图和业务字段，不能决定授权、确认、执行器或卡片结构。
+- 日历写操作先创建持久化 PendingAction，再由创建者在飞书或 React 确认。
+- 飞书交互卡片只使用 `schema: "2.0"`；卡片只携带动作名和 `action_id`，完整业务参数以数据库为准。
 - 确认与 Outbox 同事务，执行前原子 claim，并记录 action attempt。
 - Outbox 由独立消费者恢复；远端结果不确定时进入 UNKNOWN，不会盲目重试。
 - Scheduler 的 job、重试和下一运行时间持久化，并使用 SQLite leader lease 与 fencing token。
 - Audit log 记录 trace/action/result/hash，不保存 token、完整消息、完整文档或隐藏思维链。
 - Agent run/step 只记录决策摘要、参数 hash/shape 和结果摘要。
+- 上下文分为 Request、Business、Conversation、Summary、Memory、Retrieved 六层；
+  原始消息永久保留，结构化摘要和长期记忆分别持久化。
+- 大型工具结果存入 `tool_results`，Agent 上下文只保留摘要和 `result_ref`。
 
 ## 技术栈
 
@@ -32,7 +45,10 @@ Song Agent 2.0 是 Python + FastAPI 实现的多用户飞书智能体。自然�
 建议权限至少包括：
 
 - 应用身份：`im:message:send_as_bot`、`im:message.group_at_msg:readonly`、`im:message.p2p_msg:readonly`
-- 用户身份：`calendar:calendar`、`calendar:calendar:readonly`、`docx:document`、`drive:drive`、`search:docs:read`、`offline_access`
+- 用户身份：`calendar:calendar`、`calendar:calendar:readonly`、
+  `calendar:calendar.event:create`、`calendar:calendar.event:read`、
+  `task:task:read`、`task:task:write`、`docx:document`、`drive:drive`、
+  `search:docs:read`、`offline_access`
 - 长连接事件：`im.message.receive_v1`
 - 卡片回调：`card.action.trigger`
 
@@ -49,6 +65,22 @@ https://你的域名/feishu/card/action
 uv sync
 cp .env.example .env
 uv run song-agent --reload
+```
+
+React 开发服务：
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+生产构建：
+
+```bash
+cd frontend
+npm ci
+npm run build
 ```
 
 开发环境可使用 ngrok：
@@ -107,6 +139,7 @@ uv run song-agent-rotate-keys
 uv run ruff check song_agent tests
 uv run pytest -q
 curl http://127.0.0.1:45837/health
+cd frontend && npm test -- --run && npm run build
 ```
 
 数据保存在 `.data/song-agent.db`，权限为 `0600`。旧 `.data/state.json` 仅在首次迁移时读取，迁移后不会继续写入。
@@ -115,9 +148,12 @@ curl http://127.0.0.1:45837/health
 
 ## 飞书 CLI
 
-本机已安装官方 `lark-cli` v1.0.76。涉及飞书资源调试或人工运维时优先使用 CLI，并遵守其 dry-run、用户身份和高风险确认门禁；CLI 尚未绑定用户账号，Song Agent 的生产多用户运行时也不会共享 CLI 用户凭据。
+本机 CLI 位于 `/home/yqy/.local/bin/lark-cli`。涉及飞书资源调试或人工运维时优先使用 CLI，并遵守其 dry-run、用户身份和高风险确认门禁；CLI 用户凭据不会被 Song Agent 运行时复用。
 
-# 临时取消代理运行
+临时取消代理运行：
+
+```bash
 source /home/yqy/Projects/song-agent/.venv/bin/activate
 unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy
-uv run song-agent
+uv run song-agent  --reload
+```

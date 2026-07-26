@@ -38,7 +38,9 @@ class FeishuOAuth:
         self.logger = logging.getLogger(__name__)
         self._refresh_locks: dict[str, asyncio.Lock] = {}
         self._worker_id = f"oauth:{uuid.uuid4()}"
-        self.on_authorized: Callable[[str, str], Awaitable[None]] | None = None
+        self.on_authorized: (
+            Callable[[FeishuIdentity, str, str], Awaitable[None]] | None
+        ) = None
         self.router = APIRouter()
         self.router.add_api_route("/oauth/callback", self.handle_callback, methods=["GET"])
 
@@ -81,15 +83,51 @@ class FeishuOAuth:
             app_id=identity.app_id,
         )
         if not token:
+            self.logger.warning(
+                "未找到飞书用户令牌 subject=%s tenant=%s app=%s required_scopes=%s",
+                identity.subject_id,
+                identity.tenant_key,
+                identity.app_id,
+                required_scopes or self.settings.required_oauth_scopes,
+            )
             return None
         scopes = {item for item in token.scope.replace(",", " ").split() if item}
-        if any(item not in scopes for item in (required_scopes or self.settings.required_oauth_scopes)):
+        missing_scopes = [
+            item
+            for item in (required_scopes or self.settings.required_oauth_scopes)
+            if item not in scopes
+        ]
+        if missing_scopes:
+            self.logger.warning(
+                "飞书用户令牌 scope 不足 subject=%s missing_scopes=%s granted_scopes=%s",
+                identity.subject_id,
+                missing_scopes,
+                sorted(scopes),
+            )
             return None
         now = int(time.time() * 1000)
         if token.expires_at > now + 60_000:
+            self.logger.info(
+                "飞书用户令牌可用 subject=%s expires_in_seconds=%d scopes=%s",
+                identity.subject_id,
+                (token.expires_at - now) // 1000,
+                sorted(scopes),
+            )
             return self._context(token)
         if token.refresh_expires_at <= now + 60_000:
+            self.logger.warning(
+                "飞书用户令牌及刷新令牌均已过期 subject=%s "
+                "access_expires_in_seconds=%d refresh_expires_in_seconds=%d",
+                identity.subject_id,
+                (token.expires_at - now) // 1000,
+                (token.refresh_expires_at - now) // 1000,
+            )
             return None
+        self.logger.info(
+            "飞书用户令牌即将过期，开始刷新 subject=%s expires_in_seconds=%d",
+            identity.subject_id,
+            (token.expires_at - now) // 1000,
+        )
         lock_key = ":".join((identity.tenant_key, identity.app_id, identity.subject_id))
         lock = self._refresh_locks.setdefault(lock_key, asyncio.Lock())
         try:
@@ -180,7 +218,7 @@ class FeishuOAuth:
                 raise RuntimeError("授权账号与消息发送者不一致")
             await self.store.save_token(self._stored_token(identity, payload, actual_user))
             if self.on_authorized:
-                await self.on_authorized(chat_id, original_request)
+                await self.on_authorized(identity, chat_id, original_request)
             # 授权成功后自动跳转回飞书聊天
             feishu_link = f"https://applink.feishu.cn/client/chat/open?openChatId={chat_id}"
             return HTMLResponse(

@@ -26,7 +26,7 @@ class ContextConfig:
     max_preference_chars: int = 300
 
 
-class ContextBuilder:
+class AgentContextBuilder:
     """
     Agent 上下文构建器。
 
@@ -69,33 +69,34 @@ class ContextBuilder:
         Returns:
             系统提示词
         """
-        # 基础系统提示词
+        # 基础系统提示词（压缩版）
         parts = [
-            "你是宋管家的 ReAct 决策器。只输出 JSON，不输出隐藏推理。",
-            "每一步只能选择 final_answer、ask_user 或 tool_call。",
-            "需要真实操作时必须调用工具；禁止声称已执行尚未调用的操作。",
-            "外部写入只能调用 prepare 工具；commit 工具不可见，也不得猜测。",
-            "调用工具时必须在本次 decision 的 arguments 中一次性给出工具 schema 要求的完整参数。",
-            "计划、复盘和文档正文都由本次 decision 生成；工具不会再次调用模型补全。",
-            "普通问候、说明和无需工具的问题直接使用 final_answer，不调用工具。",
-            "计划只拆分用户明确提到的事项：A=关键必做，B=重要，C=辅助生活；未明确时间必须为 null。",
-            "复盘只能依据明确反馈；today_tasks 中未提到的任务标记 unconfirmed。",
-            "文档不得虚构事实、数据、人物或引用；信息不足时明确标记待补充。",
-            "信息不足时 ask_user。工具结果会作为 observation 提供给下一步。",
-            "工具结果显示成功后，应基于结果直接回答或进入下一项工作；不得仅变更参数后重复执行已完成的操作。",
-            "decision_summary 只写简短决策摘要，不写思维链。",
+            "你是宋管家的 ReAct 决策器。只输出 JSON。",
+            "每步选择：final_answer（直接回答）、ask_user（询问）、tool_call（调用工具）。",
+            "",
+            "## 核心规则",
+            "- 需真实操作必须调用工具，禁止声称已执行未调用的操作",
+            "- 只能调用“可用工具”中列出的精确工具名，禁止自造工具名",
+            "- 工具参数必须一次性完整给出",
+            "- 普通问候/说明直接 final_answer",
+            "",
+            "## 其他业务规则",
+            "- 计划：A=关键必做，B=重要，C=辅助生活；未明确时间=null",
+            "- 复盘：只依据明确反馈，未提到任务标记 unconfirmed",
+            "- 文档：不得虚构，信息不足标记待补充",
+            "- 文档格式：日期标题必须包含具体时间，格式为 `## YYYY-MM-DD HH:MM`",
             "",
         ]
 
         # 添加状态摘要（从 metadata 获取）
         state_summary = context.metadata.get("state_summary", "")
         if state_summary:
-            parts.append(f"当前状态：{state_summary}")
+            parts.append(f"状态：{state_summary}")
 
         # 添加当前时间
         current_time = context.metadata.get("current_time", "")
         if current_time:
-            parts.append(f"当前时间：{current_time}")
+            parts.append(f"时间：{current_time}")
 
         # 添加今日任务摘要（从 metadata 获取）
         today_tasks = context.metadata.get("today_tasks", [])
@@ -110,23 +111,23 @@ class ContextBuilder:
             )
             parts.append(f"今日任务：\n{task_text}")
 
-        # 添加工具 Schema
+        # 添加工具 Schema（简化格式）
         if include_tools and tool_schemas:
             parts.append("")
             parts.append("可用工具：")
-            parts.append(_format_tool_schemas_json(tool_schemas))
+            parts.append(_format_tool_schemas_compact(tool_schemas))
 
-        # 添加输出格式说明
+        # 添加输出格式说明（压缩版）
         parts.append("")
-        parts.append("输出格式（必须严格遵循）：")
+        parts.append("输出格式：")
         parts.append(
-            '直接回答：{"type":"final_answer","content":"回答内容","tool_name":"","arguments":{},"decision_summary":"简短摘要"}'
+            '回答：{"type":"final_answer","content":"内容","tool_name":"","arguments":{},"decision_summary":"摘要"}'
         )
         parts.append(
-            '询问用户：{"type":"ask_user","content":"问题内容","tool_name":"","arguments":{},"decision_summary":"简短摘要"}'
+            '询问：{"type":"ask_user","content":"问题","tool_name":"","arguments":{},"decision_summary":"摘要"}'
         )
         parts.append(
-            '调用工具：{"type":"tool_call","content":"","tool_name":"工具名","arguments":{参数},"decision_summary":"简短摘要"}'
+            '工具：{"type":"tool_call","content":"","tool_name":"工具名","arguments":{参数},"decision_summary":"摘要"}'
         )
 
         return "\n".join(parts)
@@ -153,6 +154,24 @@ class ContextBuilder:
 
         # 添加用户当前输入
         parts.append(f"用户输入：{context.user_text}")
+
+        if include_history:
+            history = context.metadata.get("conversation_context", [])
+            formatted = self._format_history(history, self.config.max_history_messages)
+            if formatted:
+                parts.append(f"最近对话：\n{formatted}")
+
+        summary = context.metadata.get("summary_context")
+        if summary:
+            parts.append(f"历史摘要：{summary}")
+
+        memories = context.metadata.get("memory_context")
+        if memories:
+            parts.append(f"长期记忆：{memories}")
+
+        retrieved = context.metadata.get("retrieved_context")
+        if retrieved:
+            parts.append(f"本次检索上下文：{retrieved}")
 
         # 添加对话键
         if context.conversation_key:
@@ -318,8 +337,44 @@ class ContextBuilder:
         return "完成"
 
 
+def _format_tool_schemas_compact(schemas: list[dict]) -> str:
+    """
+    将工具 Schema 列表格式化为紧凑的文本格式，减少 token 数量。
+
+    格式示例：
+    plans.save_draft: 根据用户消息保存计划草稿
+    参数：tasks (array, 必需), date (string)
+
+    相比 JSON 格式节省约 60% token。
+    """
+    parts = []
+    for schema in schemas:
+        name = schema.get("name", "unknown")
+        desc = schema.get("description", "")
+        params = schema.get("parameters", {})
+
+        # 工具名称和描述
+        parts.append(f"{name}: {desc}")
+
+        # 参数列表（紧凑格式）
+        if isinstance(params, dict):
+            props = params.get("properties", {})
+            required = params.get("required", [])
+            if props:
+                param_strs = []
+                for pname, pschema in props.items():
+                    ptype = pschema.get("type", "any")
+                    req = ", 必需" if pname in required else ""
+                    param_strs.append(f"{pname} ({ptype}{req})")
+                parts.append(f"  参数：{', '.join(param_strs)}")
+
+        parts.append("")
+
+    return "\n".join(parts)
+
+
 def _format_tool_schemas_json(schemas: list[dict]) -> str:
-    """将工具 Schema 列表格式化为 JSON 字符串"""
+    """将工具 Schema 列表格式化为 JSON 字符串（已废弃，使用 _format_tool_schemas_compact）"""
     import json
 
     return json.dumps(schemas, ensure_ascii=False, separators=(",", ":"))

@@ -51,10 +51,43 @@ class ActionOutboxWorker:
                 "检测到 %d 个执行租约过期的动作，已转入远端状态核对",
                 recovered,
             )
-        for action_id in await self.store.ready_outbox_action_ids():
+        action_ids = await self.store.ready_outbox_action_ids()
+        if action_ids:
+            self.logger.info(
+                "Action outbox 发现待执行动作 count=%d action_ids=%s",
+                len(action_ids),
+                action_ids,
+            )
+        for action_id in action_ids:
             action = await self.store.get_pending_action(action_id)
             if action is not None:
-                await self.execute(action)
+                self.logger.info(
+                    "Action outbox 开始分发 action_id=%s action_type=%s status=%s",
+                    action.action_id,
+                    action.action_type,
+                    action.status,
+                )
+                try:
+                    await self.execute(action)
+                except Exception:
+                    self.logger.exception(
+                        "Action outbox 分发异常 action_id=%s action_type=%s",
+                        action.action_id,
+                        action.action_type,
+                    )
+                    raise
+                latest = await self.store.get_pending_action(action_id)
+                self.logger.info(
+                    "Action outbox 分发完成 action_id=%s status=%s attempt_count=%s",
+                    action_id,
+                    latest.status if latest else "missing",
+                    latest.attempt_count if latest else "unknown",
+                )
+            else:
+                self.logger.error(
+                    "Action outbox 引用了不存在的动作 action_id=%s",
+                    action_id,
+                )
         for action in await self.store.unknown_remote_actions():
             await self.reconcile(action)
 

@@ -243,6 +243,13 @@ class PendingAction(BaseModel):
     attempt_count: int = 0
     remote_resource_id: str = ""
     remote_request_id: str = ""
+    payload_version: int = 1
+    idempotency_key: str = ""
+    source: str = "legacy_agent"
+    source_card_message_id: str = ""
+    error_code: str = ""
+    error_message: str = ""
+    result: dict[str, Any] = Field(default_factory=dict)
 
 
 class ScheduledJob(BaseModel):

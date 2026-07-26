@@ -10,7 +10,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import re
 import time
 from dataclasses import dataclass
 from typing import TypeVar
@@ -220,7 +219,7 @@ class StructuredLlm:
 
         self.logger.info(
             "🧠 LLM 开始思考 run_id=%s step=%d model=%s output=%s input_chars=%d "
-            "max_tokens=%d fingerprint=%s",
+            "max_tokens=%d fingerprint=%s timeout=%ds",
             run_id,
             step_index,
             self.settings.llm_model,
@@ -228,6 +227,7 @@ class StructuredLlm:
             len(user),
             max_tokens,
             request_fingerprint,
+            self.settings.llm_read_timeout_seconds,
         )
 
         # 初始化重试计数器
@@ -342,34 +342,50 @@ class StructuredLlm:
             # 使用 JSON 输出格式
             # 大多数 OpenAI 兼容 API（SiliconFlow、DeepSeek、GLM 等）都支持此参数
             request_params["response_format"] = {"type": "json_object"}
-            
+
             # 调用 OpenAI API
+            self.logger.debug(
+                "🧠 LLM API 调用开始 run_id=%s step=%d model=%s",
+                run_id,
+                step_index,
+                self.settings.llm_model,
+            )
+            api_started_at = time.perf_counter()
             response = await self.client.chat.completions.create(**request_params)
+            api_duration_ms = int((time.perf_counter() - api_started_at) * 1000)
+            self.logger.debug(
+                "🧠 LLM API 调用完成 run_id=%s step=%d duration_ms=%d",
+                run_id,
+                step_index,
+                api_duration_ms,
+            )
 
             # 提取响应内容
             raw = response.choices[0].message.content
             if not raw or not raw.strip():
                 raise LLMInvalidResponseError("模型返回了空内容")
 
-            # 解析 JSON
+            # response_format=json_object 保证 JSON 语法；Pydantic 只校验业务结构。
             try:
-                result = schema.model_validate(json.loads(extract_json(raw)))
+                result = schema.model_validate(json.loads(raw))
             except (json.JSONDecodeError, ValueError) as e:
                 raise LLMInvalidResponseError(f"模型返回内容不是有效的 JSON: {e}") from e
 
             return result
 
-        except RETRYABLE_ERRORS:
+        except RETRYABLE_ERRORS as e:
             # 增加重试计数
             self._retry_counts[retry_key] = self._retry_counts.get(retry_key, 0) + 1
 
-            # 记录重试
+            # 记录重试（包含具体异常信息）
             self.logger.warning(
-                "🧠 LLM 请求失败，准备重试 run_id=%s step=%d attempt=%d fingerprint=%s",
+                "🧠 LLM 请求失败，准备重试 run_id=%s step=%d attempt=%d fingerprint=%s error=%s: %s",
                 run_id,
                 step_index,
                 self._retry_counts[retry_key],
                 request_fingerprint,
+                type(e).__name__,
+                str(e)[:200],
             )
 
             # 重新抛出异常，让 tenacity 处理重试
@@ -402,16 +418,6 @@ class StructuredLlm:
 # ============================================================================
 # 辅助函数
 # ============================================================================
-def extract_json(content: str) -> str:
-    """从内容中提取 JSON"""
-    trimmed = re.sub(r"^```(?:json)?\s*", "", content.strip(), flags=re.IGNORECASE)
-    trimmed = re.sub(r"\s*```$", "", trimmed)
-    start, end = trimmed.find("{"), trimmed.rfind("}")
-    if start < 0 or end < start:
-        raise RuntimeError("模型返回内容不是 JSON")
-    return trimmed[start : end + 1]
-
-
 def api_error_message(response: httpx.Response) -> str | None:
     """提取 OpenAI 兼容接口的安全错误摘要，不记录响应中的其他数据。"""
     try:

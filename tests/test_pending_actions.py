@@ -64,7 +64,8 @@ async def test_pending_action_binds_creator_hash_expiry_and_exactly_once(tmp_pat
         card = calendar_confirmation_card("待确认", action)
         serialized = json.dumps(card)
         assert action.action_id in serialized
-        assert action.payload_hash in serialized
+        assert action.payload_hash not in serialized
+        assert "pending_action.confirm" in serialized
         assert "access_token" not in serialized and "refresh_token" not in serialized
         assert not await store.claim_pending_action(
             action.action_id,
@@ -156,7 +157,8 @@ async def test_document_card_contains_only_action_locator_not_document_content(
         )
         serialized = json.dumps(document_confirmation_card("安全摘要", action))
         assert action.action_id in serialized
-        assert action.payload_hash in serialized
+        assert action.payload_hash not in serialized
+        assert "pending_action.confirm" in serialized
         assert "confidential body" not in serialized
         assert "doc-token" not in serialized
         stored = await store.get_pending_action(action.action_id)

@@ -22,7 +22,7 @@ from lark_oapi.ws import Client as WsClient
 
 from ..config import Settings
 from ..feishu.cards import business_confirmation_card, document_confirmation_card
-from ..models import IncomingMessage, PendingAction
+from ..models import IncomingAttachmentRef, IncomingMessage, PendingAction
 from ..store import SqliteStore
 
 MessageHandler = Callable[[IncomingMessage], Awaitable[None]]
@@ -44,14 +44,26 @@ class FeishuTransport:
         builder = lark.Client.builder().app_id(settings.feishu_app_id).app_secret(settings.feishu_app_secret)
         self.client = builder.domain(settings.domain).build()
         self._thread: threading.Thread | None = None
+        self._accepting = False
+        self._futures: set[Any] = set()
+        self._futures_lock = threading.Lock()
 
     async def initialize(self) -> None:
         self.group_ids.update(await self.store.group_chat_ids(app_id=self.settings.feishu_app_id))
 
     def start(self, loop: asyncio.AbstractEventLoop, handler: MessageHandler) -> None:
+        self._accepting = True
+
         def on_event(event: P2ImMessageReceiveV1) -> None:
-            future = asyncio.run_coroutine_threadsafe(self._dispatch(event, handler), loop)
-            future.add_done_callback(self._log_future_error)
+            with self._futures_lock:
+                if not self._accepting:
+                    return
+                future = asyncio.run_coroutine_threadsafe(
+                    self._dispatch(event, handler),
+                    loop,
+                )
+                self._futures.add(future)
+            future.add_done_callback(self._finish_future)
 
         dispatcher = (
             lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(on_event).build()
@@ -68,6 +80,24 @@ class FeishuTransport:
         self._thread = threading.Thread(target=_run_ws_client, args=(ws,), name="feishu-ws", daemon=True)
         self._thread.start()
         self.logger.info("飞书 WebSocket 长连接已启动")
+
+    async def close(self, *, timeout_seconds: float = 30) -> None:
+        with self._futures_lock:
+            self._accepting = False
+            futures = list(self._futures)
+        if not futures:
+            return
+        wrapped = [asyncio.wrap_future(future) for future in futures]
+        _, pending = await asyncio.wait(wrapped, timeout=timeout_seconds)
+        if pending:
+            self.logger.warning(
+                "关闭时取消 %d 个未完成飞书消息任务",
+                len(pending),
+            )
+            for future in futures:
+                if not future.done():
+                    future.cancel()
+            await asyncio.gather(*wrapped, return_exceptions=True)
 
     async def send_markdown(self, chat_id: str, markdown: str) -> str | None:
         self.logger.info("📤 管家返回消息 chat=%s content=%r", chat_id, markdown)
@@ -127,6 +157,18 @@ class FeishuTransport:
             event_id = getattr(header, "event_id", "") or ""
             if not message or not subject_id or not open_id or not message.chat_id or not message.message_id:
                 return
+            message_type = message.message_type or ""
+            raw_content = message.content or ""
+            self.logger.info(
+                "📥 飞书消息事件 message_id=%s event_id=%s chat=%s "
+                "chat_type=%s message_type=%s content_chars=%d",
+                message.message_id,
+                event_id or message.message_id,
+                message.chat_id,
+                message.chat_type,
+                message_type,
+                len(raw_content),
+            )
             if message.chat_type not in {"p2p", "group"}:
                 return
             if message.chat_type == "group":
@@ -150,7 +192,19 @@ class FeishuTransport:
                     tenant_key=tenant_key,
                     app_id=self.settings.feishu_app_id,
                 )
-            text = parse_message_text(message.message_type or "", message.content or "")
+            text = parse_message_text(message_type, raw_content)
+            attachments = parse_message_attachments(
+                message_type,
+                raw_content,
+            )
+            self.logger.info(
+                "📎 飞书消息已解析 message_id=%s message_type=%s "
+                "text_chars=%d attachments=%d",
+                message.message_id,
+                message_type,
+                len(text),
+                len(attachments),
+            )
             await handler(
                 IncomingMessage(
                     message_id=message.message_id,
@@ -165,14 +219,17 @@ class FeishuTransport:
                     thread_id=getattr(message, "thread_id", "") or "",
                     root_id=getattr(message, "root_id", "") or "",
                     chat_type=message.chat_type,
-                    message_type=message.message_type or "",
+                    message_type=message_type,
                     text=text,
+                    attachments=attachments,
                 )
             )
         except Exception:
             self.logger.exception("处理飞书消息事件失败")
 
-    def _log_future_error(self, future: Any) -> None:
+    def _finish_future(self, future: Any) -> None:
+        with self._futures_lock:
+            self._futures.discard(future)
         try:
             future.result()
         except Exception:
@@ -190,6 +247,51 @@ def parse_message_text(message_type: str, content: str) -> str:
     if message_type == "post":
         return "\n".join(_flatten_post(payload)).strip()
     return ""
+
+
+def parse_message_attachments(
+    message_type: str,
+    content: str,
+) -> list[IncomingAttachmentRef]:
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, dict):
+        return []
+    if message_type == "post":
+        keys = _post_image_keys(payload)
+        return [
+            IncomingAttachmentRef(
+                kind="image",
+                resource_key=key,
+                resource_type="image",
+                filename=f"image-{index}.png",
+            )
+            for index, key in enumerate(dict.fromkeys(keys), start=1)
+        ]
+    if message_type == "image" and isinstance(payload.get("image_key"), str):
+        return [
+            IncomingAttachmentRef(
+                kind="image",
+                resource_key=payload["image_key"],
+                resource_type="image",
+                filename="image.png",
+            )
+        ]
+    file_key = payload.get("file_key")
+    if not isinstance(file_key, str) or not file_key:
+        return []
+    filename = payload.get("file_name") if isinstance(payload.get("file_name"), str) else ""
+    kind = "audio" if message_type == "audio" else _kind_for_filename(filename)
+    return [
+        IncomingAttachmentRef(
+            kind=kind,
+            resource_key=file_key,
+            resource_type="file",
+            filename=filename,
+        )
+    ]
 
 
 def clean_incoming_text(text: str) -> str:
@@ -235,3 +337,37 @@ def _flatten_post(value: Any) -> list[str]:
         if key not in metadata:
             result.extend(_flatten_post(child))
     return result
+
+
+def _post_image_keys(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [key for child in value for key in _post_image_keys(child)]
+    if not isinstance(value, dict):
+        return []
+    result = [value["image_key"]] if isinstance(value.get("image_key"), str) else []
+    for child in value.values():
+        result.extend(_post_image_keys(child))
+    return result
+
+
+def _kind_for_filename(filename: str) -> str:
+    suffix = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    if suffix in {"png", "jpg", "jpeg", "gif", "webp", "bmp"}:
+        return "image"
+    if suffix in {"mp3", "wav", "ogg", "m4a", "amr", "aac"}:
+        return "audio"
+    if suffix in {
+        "txt",
+        "md",
+        "markdown",
+        "csv",
+        "json",
+        "pdf",
+        "docx",
+        "pptx",
+        "xlsx",
+        "html",
+        "htm",
+    }:
+        return "document"
+    return "unknown"

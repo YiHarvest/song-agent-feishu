@@ -13,7 +13,8 @@ from collections.abc import Mapping
 from contextlib import asynccontextmanager
 
 import lark_oapi as lark
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from lark_oapi.core.const import (
     LARK_REQUEST_NONCE,
     LARK_REQUEST_SIGNATURE,
@@ -23,17 +24,24 @@ from lark_oapi.core.const import (
 )
 from lark_oapi.core.model import RawRequest
 
+from .api import agent_api
 from .api import calendar as calendar_api
 from .api import chat as chat_api
 from .api import events as events_api
 from .api import pending_actions as pending_actions_api
 from .api import reminders as reminders_api
 from .api import tasks as tasks_api
+from .api.agent_auth import ApiRateLimiter
 from .application.calendar_service import CalendarApplicationService
+from .application.openai_adapter import OpenAIAdapter
 from .application.pending_action_service import PendingActionApplicationService
 from .application.reminder_service import ReminderApplicationService
 from .application.request_router import RequestRouter
 from .application.task_service import TaskApplicationService
+from .attachments.cleanup import AttachmentCleanup
+from .attachments.repository import AttachmentRepository
+from .attachments.service import AttachmentService
+from .attachments.tools import AttachmentTools
 from .config import Settings
 from .context.builders import AgentRuntimeContextBuilder, BusinessContextBuilder
 from .context.service import ConversationContextService
@@ -53,17 +61,22 @@ from .executors.task_executor import (
 )
 from .feishu.callbacks import FeishuCardCallbacks
 from .feishu.mcp import FeishuMcp
+from .feishu.media import FeishuMediaDownloader
 from .feishu.oauth import FeishuOAuth
 from .feishu.openapi import FeishuOpenApi
 from .feishu.transport import FeishuTransport
 from .intelligence.general_agent import GeneralAgent
 from .intelligence.intent_extractor import IntentExtractor
 from .llm import StructuredLlm
+from .media.asr_client import AsrClient
+from .media.vision_client import VisionClient
 from .models import FeishuIdentity, IncomingMessage
 from .observability.context import trace_scope
+from .parsers.document_client import MinerUDocumentClient
 from .planner import Planner
 from .scheduler import start_scheduler
 from .search.mcp import SearchMcp
+from .services.api_access import ApiAccessService
 from .services.audit import AuditService
 from .services.encryption import AesGcmTokenCipher
 from .services.outbox import ActionOutboxWorker
@@ -139,6 +152,39 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         transport = FeishuTransport(config, store)
         await transport.initialize()
+        attachment_tools = None
+        attachment_service = None
+        vision_client = None
+        asr_client = None
+        document_client = None
+        attachment_cleanup = None
+        if config.song_agent_attachments_enabled:
+            attachment_repository = AttachmentRepository(store)
+            vision_client = VisionClient(config)
+            asr_client = AsrClient(config)
+            document_client = MinerUDocumentClient(config)
+            attachment_tools = AttachmentTools(
+                config,
+                store,
+                attachment_repository,
+                vision_client,
+                asr_client,
+                document_client,
+            )
+            attachment_service = AttachmentService(
+                config,
+                FeishuMediaDownloader(
+                    transport.client,
+                    timeout_seconds=config.song_agent_attachment_download_timeout_seconds,
+                ),
+                attachment_repository,
+                attachment_tools,
+            )
+            await attachment_service.initialize()
+            attachment_cleanup = AttachmentCleanup(
+                attachment_repository,
+                config.song_agent_attachment_dir,
+            )
         structured_llm = StructuredLlm(config)
         planner = Planner(structured_llm, config.timezone)
         mcp = FeishuMcp(config)
@@ -159,6 +205,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             search_mcp,
             pending_actions,
             audit,
+            attachment_tools,
+            attachment_service,
         )
         pending_action_service = PendingActionApplicationService(store, audit)
         calendar_service = CalendarApplicationService(
@@ -191,6 +239,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             agent_contexts,
         )
         workflow.set_request_router(request_router)
+        api_access_service = ApiAccessService(
+            store,
+            api_app_id=config.song_agent_api_app_id,
+            binding_code_ttl_seconds=config.song_agent_api_binding_code_ttl_seconds,
+        )
+        app.state.api_access_service = api_access_service
+        app.state.openai_adapter = OpenAIAdapter(config, store, request_router)
         executors = ExecutorRegistry(legacy_handler=workflow.execute_pending_action)
         executors.register(
             CalendarCreateExecutor(store, oauth, openapi, audit, transport)
@@ -256,6 +311,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         oauth.on_authorized = handle_oauth_authorized
         transport.start(asyncio.get_running_loop(), workflow.enqueue)
         scheduler = await start_scheduler(config, store, transport)
+        if attachment_cleanup is not None:
+            scheduler.add_job(
+                attachment_cleanup.run_once,
+                "interval",
+                hours=24,
+                id="attachment-cleanup",
+                name="低优先级附件清理",
+                max_instances=1,
+                coalesce=True,
+                replace_existing=True,
+            )
         outbox.start()
         app.state.store = store
         app.state.settings = config
@@ -270,6 +336,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.conversation_contexts = conversation_contexts
         app.state.pending_action_service = pending_action_service
         app.state.request_router = request_router
+        app.state.attachment_service = attachment_service
         card_callbacks = FeishuCardCallbacks(
             pending_action_service,
             asyncio.get_running_loop(),
@@ -299,10 +366,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             scheduler.shutdown(wait=False)
             await outbox.close()
+            await transport.close(
+                timeout_seconds=min(
+                    max(
+                        config.song_agent_vision_read_timeout_seconds + 5,
+                        config.song_agent_document_parse_timeout_seconds + 5,
+                    ),
+                    360,
+                )
+            )
+            if vision_client is not None:
+                await vision_client.close()
+            if asr_client is not None:
+                await asr_client.close()
+            if document_client is not None:
+                await document_client.close()
             await planner.llm.close()
             await store.close()
 
     app = FastAPI(title="Song Agent", version="0.3.0", lifespan=lifespan)
+    app.state.settings = config
+    app.state.store = store
+    app.state.agent_api_rate_limiter = ApiRateLimiter()
     app.include_router(oauth.router)
     app.include_router(chat_api.router)
     app.include_router(calendar_api.router)
@@ -310,6 +395,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(events_api.router)
     app.include_router(tasks_api.router)
     app.include_router(reminders_api.router)
+    if config.song_agent_api_enabled:
+        app.include_router(agent_api.router)
+
+    @app.exception_handler(HTTPException)
+    async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+        if request.url.path.startswith("/api/v1/") and isinstance(exc.detail, dict):
+            content = {"error": exc.detail}
+        else:
+            content = {"detail": exc.detail}
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=content,
+            headers=exc.headers,
+        )
 
     @app.middleware("http")
     async def trace_http_request(request: Request, call_next):

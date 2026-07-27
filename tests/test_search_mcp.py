@@ -80,6 +80,15 @@ async def test_search_result_returns_to_agent_as_observation() -> None:
     workflow = object.__new__(AgentWorkflow)
     workflow.search_mcp = FakeSearchMcp()
     workflow.store = Store()
+    metadata = {
+        "retrieved_context": [
+            {
+                "source_type": "audio",
+                "attachment_id": "att_" + "a" * 32,
+                "transcript": "检索 Harness",
+            }
+        ]
+    }
     result = await workflow._tool_websearch(
         SimpleNamespace(
             message=SimpleNamespace(
@@ -87,7 +96,7 @@ async def test_search_result_returns_to_agent_as_observation() -> None:
                 app_id="app",
                 user_id="user",
             ),
-            metadata={},
+            metadata=metadata,
         ),
         {"query": "Harness", "max_results": 3},
     )
@@ -96,6 +105,46 @@ async def test_search_result_returns_to_agent_as_observation() -> None:
     assert result.terminal is False
     assert "Agent Harnesses" in result.summary
     assert "https://learn.microsoft.com/example" in result.summary
+    assert metadata["retrieved_context"][1]["result_ref"] == "tool_result_1"
+    assert metadata["retrieved_context"][1]["items"][0]["title"] == "Agent Harnesses"
+
+
+@pytest.mark.asyncio
+async def test_tool_result_read_appends_to_attachment_context_list() -> None:
+    class Store:
+        async def get_tool_result(self, *args, **kwargs):
+            return {
+                "summary": "找到 1 条结果",
+                "payload": {
+                    "items": [
+                        {
+                            "title": "天气",
+                            "snippet": "杭州高温。",
+                            "url": "https://example.com/weather",
+                            "source": "test",
+                        }
+                    ]
+                },
+            }
+
+    workflow = object.__new__(AgentWorkflow)
+    workflow.store = Store()
+    metadata = {"retrieved_context": [{"source_type": "audio"}]}
+    result = await workflow._tool_result_read(
+        SimpleNamespace(
+            message=SimpleNamespace(
+                tenant_key="tenant",
+                app_id="app",
+                user_id="user",
+            ),
+            metadata=metadata,
+        ),
+        {"result_ref": "tool_result_1"},
+    )
+
+    assert result.status == "ok"
+    assert metadata["retrieved_context"][1]["result_ref"] == "tool_result_1"
+    assert "杭州高温" in metadata["retrieved_context"][1]["content"]
 
 
 def test_stored_search_result_compacts_at_source_boundaries() -> None:

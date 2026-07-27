@@ -6,11 +6,12 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 Priority = Literal["A", "B", "C"]
 TaskStatus = Literal["pending", "completed", "partial", "not_done", "unconfirmed"]
@@ -157,6 +158,42 @@ class ParsedPlanTask(BaseModel):
     start_time: str | None = Field(default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
     end_time: str | None = Field(default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
     repeat: RepeatType = "none"
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_task_shape(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        if not normalized.get("title") and normalized.get("name"):
+            normalized["title"] = normalized["name"]
+        normalized.pop("name", None)
+        return normalized
+
+    @field_validator("start_time", "end_time", mode="before")
+    @classmethod
+    def normalize_time(cls, value: Any) -> Any:
+        if value is None or not isinstance(value, str):
+            return value
+        text = value.strip()
+        simple = re.fullmatch(r"(\d{1,2}):([0-5]\d)", text)
+        if simple:
+            return f"{int(simple.group(1)):02d}:{simple.group(2)}"
+        if "T" in text or " " in text:
+            try:
+                return datetime.fromisoformat(text.replace("Z", "+00:00")).strftime(
+                    "%H:%M"
+                )
+            except ValueError:
+                return text
+        return text
+
+    @model_validator(mode="after")
+    def default_end_time(self) -> ParsedPlanTask:
+        if self.start_time and not self.end_time:
+            start = datetime.strptime(self.start_time, "%H:%M")
+            self.end_time = (start + timedelta(hours=1)).strftime("%H:%M")
+        return self
 
 
 class PlanOutput(BaseModel):

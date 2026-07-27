@@ -332,7 +332,8 @@ class AgentWorkflow:
         definitions = (
             (
                 "plans.save_draft",
-                "保存今日计划草稿。用于用户说「今天的计划」「我要做...」等计划类请求。生成多条任务，可选时间。",
+                "保存今日计划草稿。生成 ABC 分级任务；时间必须为 HH:MM。"
+                "带时间任务只准备确认卡片，用户确认后才写入日历，默认提前 10 分钟提醒。",
                 self._tool_plan_draft,
                 "local",
                 _plan_arguments_schema(),
@@ -455,7 +456,12 @@ class AgentWorkflow:
             str(context.metadata["date"]),
             parsed,
         )
-        return ToolResult(status="ok", summary="计划草稿已处理", terminal=True)
+        return ToolResult(
+            status="ok",
+            summary="计划草稿已处理",
+            terminal=True,
+            response="计划草稿已生成。请查看计划；带时间事项可在确认卡片中选择是否写入日历。",
+        )
 
     async def _tool_review(
         self,
@@ -530,6 +536,7 @@ class AgentWorkflow:
                         "title": result.title,
                         "snippet": result.snippet,
                         "url": result.url,
+                        "source": result.source,
                     }
                     for result in results
                 ],
@@ -552,7 +559,7 @@ class AgentWorkflow:
             formatted_results = []
             for i, result in enumerate(results, 1):
                 formatted_results.append(
-                    f"{i}. **{result.title}**\n"
+                    f"{i}. **{result.title}**（{result.source}）\n"
                     f"   {result.snippet}\n"
                     f"   [链接]({result.url})"
                 )
@@ -591,18 +598,20 @@ class AgentWorkflow:
         context: AgentContext,
         arguments: dict[str, Any],
     ) -> ToolResult:
+        result_ref = str(arguments["result_ref"])
         result = await self.store.get_tool_result(
-            str(arguments["result_ref"]),
+            result_ref,
             tenant_key=context.message.tenant_key,
             app_id=context.message.app_id,
             principal_id=context.message.user_id,
         )
         if not result:
             return ToolResult(status="error", summary="工具结果不存在、已过期或无权访问")
-        serialized = json.dumps(result["payload"], ensure_ascii=False)
+        summary = _format_stored_tool_result(result)
+        context.metadata.setdefault("retrieved_context", {})[result_ref] = summary
         return ToolResult(
             status="ok",
-            summary=f"{result['summary']}\n{serialized[:1800]}",
+            summary=summary,
         )
 
     async def _create_draft(
@@ -725,7 +734,10 @@ class AgentWorkflow:
             )
             await self.transport.send_confirmation_card(
                 message.chat_id,
-                format_plan(record),
+                format_plan(record)
+                + "\n\n**是否加入飞书日历？**"
+                "\n点击确认后才会写入；默认提前 **10 分钟**提醒。"
+                "\n如需其他提醒时间，请先取消，再说明提前分钟数。",
                 action,
             )
             self.logger.info(
@@ -918,6 +930,10 @@ class AgentWorkflow:
     async def execute_pending_action(self, action: PendingAction) -> None:
         if action.action_type.startswith("document."):
             await self._execute_pending_document(action)
+        elif action.action_type == "calendar.create" and isinstance(
+            action.payload.get("record_key"), str
+        ):
+            await self._execute_pending_calendar(action)
         else:
             await self.store.mark_action_unknown(
                 action.action_id,
@@ -1050,10 +1066,193 @@ class AgentWorkflow:
                 ),
             )
 
+    async def _execute_pending_calendar(self, action: PendingAction) -> None:
+        remote_call_started = False
+        try:
+            if not await self.store.claim_action_execution(
+                action.action_id,
+                worker_id=f"plan-calendar:{id(self)}",
+            ):
+                return
+            record = await self.store.get_record_by_key(
+                str(action.payload["record_key"])
+            )
+            if (
+                not record
+                or record.user_id != action.creator_subject_id
+                or record.updated_at != action.payload.get("record_updated_at")
+            ):
+                await self.store.expire_pending_action(action.action_id)
+                await self.transport.send_markdown(
+                    action.chat_id,
+                    "该确认卡片对应的计划已变化或不存在，已拒绝执行。请重新提交计划。",
+                )
+                return
+            identity = FeishuIdentity(
+                tenant_key=action.tenant_key,
+                app_id=action.app_id,
+                open_id=action.creator_open_id,
+                union_id=action.creator_subject_id,
+            )
+            scopes = ("calendar:calendar", "calendar:calendar:readonly")
+            token_context = await self.oauth.get_valid_token_context(identity, scopes)
+            if not token_context:
+                await self.store.finish_pending_action(
+                    action.action_id,
+                    success=False,
+                )
+                url = await self.oauth.create_authorization_url(
+                    identity,
+                    action.chat_id,
+                    scopes,
+                )
+                await self.transport.send_markdown(
+                    action.chat_id,
+                    f"创建日程需要你本人授权。[点击这里完成授权]({url})，"
+                    "授权后重新提交计划。",
+                )
+                return
+            task_ids = {str(item) for item in action.payload.get("task_ids", [])}
+            remote_call_started = True
+            result = await self.openapi.create_events(
+                record,
+                token_context,
+                task_ids,
+            )
+            event_ids = dict(result.created)
+            if event_ids:
+                await self.store.record_action_remote_success(
+                    action.action_id,
+                    remote_resource_id=json.dumps(event_ids, sort_keys=True),
+                )
+            for plan_task in record.tasks:
+                if plan_task.id in event_ids:
+                    plan_task.calendar_event_id = event_ids[plan_task.id]
+            record.plan_status = "draft" if result.failed else "confirmed"
+            record.updated_at = datetime.now(UTC).isoformat()
+            await self.store.save_record(record)
+            await self.store.finish_pending_action(
+                action.action_id,
+                success=not result.failed,
+            )
+            await self.audit.record(
+                action.action_type,
+                "partial" if result.failed else "success",
+                tenant_key=action.tenant_key,
+                app_id=action.app_id,
+                principal_id=action.creator_subject_id,
+                chat_id=action.chat_id,
+                thread_id=action.thread_id,
+                action_id=action.action_id,
+                risk_level="high",
+                payload_hash=action.payload_hash,
+                metadata={
+                    "created_count": len(result.created),
+                    "failed_count": len(result.failed),
+                },
+            )
+            lines = [
+                f"已在你本人的日历创建 {len(result.created)} 个日程，"
+                "默认提前 10 分钟提醒。"
+            ]
+            if result.failed:
+                failed_ids = "、".join(item[0] for item in result.failed)
+                lines.append(f"创建失败：{failed_ids}。请重新提交失败事项。")
+            await self.transport.send_markdown(action.chat_id, "\n".join(lines))
+        except Exception as error:
+            if remote_call_started:
+                await self.store.mark_action_unknown(
+                    action.action_id,
+                    error_code="calendar_remote_result_uncertain",
+                    error_message=str(error),
+                )
+            else:
+                await self.store.finish_pending_action(
+                    action.action_id,
+                    success=False,
+                )
+            await self.audit.record(
+                action.action_type,
+                "failure",
+                tenant_key=action.tenant_key,
+                app_id=action.app_id,
+                principal_id=action.creator_subject_id,
+                chat_id=action.chat_id,
+                thread_id=action.thread_id,
+                action_id=action.action_id,
+                risk_level="high",
+                payload_hash=action.payload_hash,
+            )
+            self.logger.exception(
+                "执行待确认计划日历动作失败 action_id=%s",
+                action.action_id,
+            )
+            await self.transport.send_markdown(
+                action.chat_id,
+                (
+                    "日历请求远端结果暂时无法确认，已停止自动重试并进入核对队列。"
+                    if remote_call_started
+                    else "日历创建失败；计划草稿仍保留，可重新提交。"
+                ),
+            )
+
+
+def _format_stored_tool_result(
+    result: dict[str, Any],
+    *,
+    max_length: int = 1900,
+) -> str:
+    """按完整来源条目压缩工具结果，避免在 JSON 或句子中间硬截断。"""
+    header = str(result.get("summary") or "工具结果")
+    payload = result.get("payload")
+    if not isinstance(payload, dict):
+        return header
+    items = payload.get("items")
+    if not isinstance(items, list):
+        keys = [str(key) for key in payload]
+        visible = keys[:20]
+        suffix = f"；另有 {len(keys) - 20} 个字段" if len(keys) > 20 else ""
+        return f"{header}\n数据字段：{'、'.join(visible)}{suffix}"
+
+    parts = [header]
+    included = 0
+    for index, item in enumerate(items, 1):
+        if not isinstance(item, dict):
+            continue
+        title = _shorten_at_boundary(str(item.get("title") or "未命名"), 120)
+        snippet = _shorten_at_boundary(str(item.get("snippet") or ""), 360)
+        url = str(item.get("url") or "")
+        source = str(item.get("source") or "未知来源")
+        block = f"{index}. [{source}] {title}\n{snippet}\n{url}".strip()
+        candidate = "\n\n".join([*parts, block])
+        if len(candidate) > max_length:
+            break
+        parts.append(block)
+        included += 1
+    omitted = len(items) - included
+    if omitted:
+        notice = f"其余 {omitted} 条未展开；可按引用继续读取。"
+        candidate = "\n\n".join([*parts, notice])
+        if len(candidate) <= max_length:
+            parts.append(notice)
+    return "\n\n".join(parts)
+
+
+def _shorten_at_boundary(text: str, max_length: int) -> str:
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if len(normalized) <= max_length:
+        return normalized
+    window = normalized[:max_length]
+    boundary = max(window.rfind(mark) for mark in ("。", "！", "？", ".", "!", "?"))
+    if boundary >= max_length // 2:
+        return window[: boundary + 1]
+    return window.rstrip("，,；;：: ") + "…"
+
+
 def _plan_arguments_schema() -> dict[str, Any]:
     nullable_time = {
         "anyOf": [
-            {"type": "string", "pattern": r"^([01]?\d|2[0-3]):[0-5]\d$"},
+            {"type": "string", "pattern": r"^([01]\d|2[0-3]):[0-5]\d$"},
             {"type": "null"},
         ]
     }
@@ -1085,10 +1284,10 @@ def _plan_arguments_schema() -> dict[str, Any]:
                             "enum": ["none", "daily", "weekdays", "weekly"],
                         },
                     },
-                    # 添加提示，帮助模型理解时间格式
                     "description": (
-                        "任务项。start_time 和 end_time 必须是 HH:MM 格式"
-                        "（如 17:26），不要使用 ISO 时间格式。"
+                        "任务项。名称字段必须是 title，不是 name。start_time 和 "
+                        "end_time 必须是 HH:MM 格式（如 17:26），不要使用 ISO。"
+                        "用户给出开始时间但未说时长时，补合理 end_time。"
                     ),
                 },
             }

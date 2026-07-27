@@ -52,6 +52,83 @@ async def test_intent_extractor_identifies_calendar_and_missing_fields() -> None
 
 
 @pytest.mark.asyncio
+async def test_planning_request_routes_to_general_without_llm() -> None:
+    llm = Llm([])
+    planning_request = request().model_copy(
+        update={
+            "text": "我今天想要在1点开会、2点吃饭、3点的时候去购物，你给我规划一下"
+        }
+    )
+
+    result = await IntentExtractor(llm, "Asia/Shanghai").extract(planning_request)
+
+    assert result.intent == "conversation.general"
+    assert result.missing_fields == []
+    assert llm.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_explicit_calendar_write_is_not_overridden_by_planning_phrase() -> None:
+    llm = Llm(
+        [
+            {
+                "intent": "calendar.create",
+                "arguments": {
+                    "summary": "今日安排",
+                    "start_time": "2026-07-27T13:00:00+08:00",
+                },
+                "missing_fields": [],
+                "confidence": 0.99,
+            }
+        ]
+    )
+    planning_request = request().model_copy(
+        update={"text": "帮我规划一下，并创建日程"}
+    )
+
+    result = await IntentExtractor(llm, "Asia/Shanghai").extract(planning_request)
+
+    assert result.intent == "calendar.create"
+    assert llm.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_optional_batch_reminder_end_times_are_not_missing() -> None:
+    llm = Llm(
+        [
+            {
+                "intent": "reminder.batch_create",
+                "arguments": {
+                    "items": [
+                        {
+                            "summary": "开会",
+                            "start_time": "2026-07-27T13:00:00+08:00",
+                        },
+                        {
+                            "summary": "吃饭",
+                            "start_time": "2026-07-27T14:00:00+08:00",
+                        },
+                    ]
+                },
+                "missing_fields": [
+                    "items[0].end_time",
+                    "items[1].end_time",
+                ],
+                "confidence": 0.99,
+            }
+        ]
+    )
+    reminder_request = request().model_copy(
+        update={"text": "下午1点提醒我开会，下午2点提醒我吃饭"}
+    )
+
+    result = await IntentExtractor(llm, "Asia/Shanghai").extract(reminder_request)
+
+    assert result.intent == "reminder.batch_create"
+    assert result.missing_fields == []
+
+
+@pytest.mark.asyncio
 async def test_intent_extractor_repairs_once() -> None:
     llm = Llm(
         [

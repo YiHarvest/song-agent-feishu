@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field, model_validator
 
 class AgentDecision(BaseModel):
     type: Literal["final_answer", "ask_user", "tool_call"]
-    content: str = Field(default="", max_length=4000)
+    content: str = Field(default="", max_length=12000)
     tool_name: str = ""
     arguments: dict[str, Any] = Field(default_factory=dict)
     decision_summary: str = Field(default="", max_length=500)
@@ -27,12 +27,12 @@ class ToolResult(BaseModel):
     status: Literal["ok", "denied", "error"]
     summary: str = Field(max_length=2000)
     terminal: bool = False
-    response: str = Field(default="", max_length=4000)
+    response: str = Field(default="", max_length=12000)
 
 
 class AgentResult(BaseModel):
     status: Literal["completed", "awaiting_user", "failed"]
-    response: str
+    response: str = Field(max_length=12000)
     step_count: int
     tool_call_count: int
     error_code: str = ""

@@ -7,6 +7,7 @@ Agent 上下文构建器。
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -81,7 +82,8 @@ class AgentContextBuilder:
             "- 普通问候/说明直接 final_answer",
             "",
             "## 其他业务规则",
-            "- 计划：A=关键必做，B=重要，C=辅助生活；未明确时间=null",
+            "- 计划：A=关键必做，B=重要，C=辅助生活；任务名使用 title，不得使用 name",
+            "- 计划时间只用 HH:MM；未明确时间=null；有开始时间但无时长时补合理结束时间",
             "- 复盘：只依据明确反馈，未提到任务标记 unconfirmed",
             "- 文档：不得虚构，信息不足标记待补充",
             "- 文档格式：日期标题必须包含具体时间，格式为 `## YYYY-MM-DD HH:MM`",
@@ -339,13 +341,11 @@ class AgentContextBuilder:
 
 def _format_tool_schemas_compact(schemas: list[dict]) -> str:
     """
-    将工具 Schema 列表格式化为紧凑的文本格式，减少 token 数量。
+    将工具 Schema 列表格式化为紧凑 JSON，保留所有嵌套约束。
 
     格式示例：
     plans.save_draft: 根据用户消息保存计划草稿
-    参数：tasks (array, 必需), date (string)
-
-    相比 JSON 格式节省约 60% token。
+      参数 JSON Schema：{"type":"object",...}
     """
     parts = []
     for schema in schemas:
@@ -356,17 +356,13 @@ def _format_tool_schemas_compact(schemas: list[dict]) -> str:
         # 工具名称和描述
         parts.append(f"{name}: {desc}")
 
-        # 参数列表（紧凑格式）
         if isinstance(params, dict):
-            props = params.get("properties", {})
-            required = params.get("required", [])
-            if props:
-                param_strs = []
-                for pname, pschema in props.items():
-                    ptype = pschema.get("type", "any")
-                    req = ", 必需" if pname in required else ""
-                    param_strs.append(f"{pname} ({ptype}{req})")
-                parts.append(f"  参数：{', '.join(param_strs)}")
+            serialized = json.dumps(
+                params,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            parts.append(f"  参数 JSON Schema：{serialized}")
 
         parts.append("")
 
@@ -375,6 +371,4 @@ def _format_tool_schemas_compact(schemas: list[dict]) -> str:
 
 def _format_tool_schemas_json(schemas: list[dict]) -> str:
     """将工具 Schema 列表格式化为 JSON 字符串（已废弃，使用 _format_tool_schemas_compact）"""
-    import json
-
     return json.dumps(schemas, ensure_ascii=False, separators=(",", ":"))

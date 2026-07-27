@@ -35,6 +35,22 @@ def test_build_tasks_generates_priority_local_ids() -> None:
     assert [task.id for task in make_record().tasks] == ["A1", "B1"]
 
 
+def test_plan_task_normalizes_model_alias_and_iso_time() -> None:
+    task = ParsedPlanTask.model_validate(
+        {
+            "name": "开会",
+            "priority": "A",
+            "start_time": "2026-07-27T13:00+08:00",
+            "end_time": None,
+        }
+    )
+
+    assert task.title == "开会"
+    assert task.start_time == "13:00"
+    assert task.end_time == "14:00"
+    assert task.repeat == "none"
+
+
 def test_confirmation_is_deliberately_narrow() -> None:
     assert is_confirmation("确认")
     assert is_confirmation("确认并创建日程")
@@ -75,6 +91,7 @@ def test_plan_output_requires_confirmation_and_mentions_own_calendar() -> None:
     output = format_plan(make_record())
     assert "确认卡片" in output
     assert "你自己的飞书日历" in output
+    assert "默认提前 10 分钟提醒" in output
     assert "10:00-11:30" in output
 
 

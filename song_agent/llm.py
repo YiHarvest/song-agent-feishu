@@ -76,6 +76,10 @@ class LLMInvalidResponseError(LLMError):
     pass
 
 
+class LLMOutputTruncatedError(LLMInvalidResponseError):
+    """LLM 因输出上限停止，内容不完整。"""
+
+
 class LLMParameterError(LLMError):
     """LLM 参数错误（不应重试）"""
     pass
@@ -360,8 +364,23 @@ class StructuredLlm:
                 api_duration_ms,
             )
 
-            # 提取响应内容
-            raw = response.choices[0].message.content
+            # 提取响应内容。达到 token 上限时，即使 JSON 被服务端闭合，
+            # 业务正文仍可能停在半句，不能当作成功结果。
+            choice = response.choices[0]
+            finish_reason = str(getattr(choice, "finish_reason", "") or "")
+            if finish_reason in {"length", "max_tokens"}:
+                self.logger.warning(
+                    "🧠 LLM 输出被截断 run_id=%s step=%d max_tokens=%d "
+                    "finish_reason=%s",
+                    run_id,
+                    step_index,
+                    max_tokens,
+                    finish_reason,
+                )
+                raise LLMOutputTruncatedError(
+                    f"模型输出达到上限: finish_reason={finish_reason}"
+                )
+            raw = choice.message.content
             if not raw or not raw.strip():
                 raise LLMInvalidResponseError("模型返回了空内容")
 

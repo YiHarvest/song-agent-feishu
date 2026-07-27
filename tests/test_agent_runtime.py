@@ -9,6 +9,7 @@ from song_agent.agent.models import AgentDecision, ToolResult
 from song_agent.agent.runtime import AgentLimits, ReActRuntime
 from song_agent.agent.tool_registry import AgentTool, ToolRegistry
 from song_agent.config import Settings
+from song_agent.llm import LLMOutputTruncatedError
 from song_agent.models import IncomingMessage
 from song_agent.policies.tool_policy import ToolPolicyGuard
 from song_agent.services.agent_runs import AgentRunRecorder
@@ -93,6 +94,64 @@ def test_context_builder_preserves_runtime_tool_summary() -> None:
 
     assert "成功：计划草稿已保存" in summary
     assert "plans.save_draft: 完成" not in summary
+
+
+def test_context_builder_preserves_nested_plan_tool_schema() -> None:
+    workflow = object.__new__(AgentWorkflow)
+    plan_tool = workflow._build_tool_registry().get("plans.save_draft")
+    assert plan_tool is not None
+
+    prompt = AgentContextBuilder().build_system_prompt(
+        context(),
+        tool_schemas=[plan_tool.schema()],
+    )
+
+    assert '"required":["title","priority","start_time","end_time","repeat"]' in prompt
+    assert '"title":{"type":"string"' in prompt
+    assert "名称字段必须是 title，不是 name" in prompt
+    assert "不要使用 ISO" in prompt
+
+
+@pytest.mark.asyncio
+async def test_runtime_uses_final_limit_and_compacts_after_truncation() -> None:
+    class TruncatingLlm:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def generate(self, schema, system, user, **kwargs):
+            del schema, user
+            self.calls.append((system, kwargs["max_tokens"]))
+            if len(self.calls) == 1:
+                raise LLMOutputTruncatedError("length")
+            return AgentDecision(type="final_answer", content="完整摘要")
+
+    llm = TruncatingLlm()
+    configured = settings()
+    agent = ReActRuntime(
+        llm,
+        ToolRegistry(),
+        ToolPolicyGuard(),
+        AgentLimits(),
+        settings=configured,
+    )
+    ctx = context()
+    ctx.user_text = "总结今天的 AI 新闻"
+
+    result = await agent.run(ctx)
+
+    assert result.status == "completed"
+    assert result.response == "完整摘要"
+    assert [max_tokens for _, max_tokens in llm.calls] == [
+        configured.llm_final_max_tokens,
+        configured.llm_final_max_tokens,
+    ]
+    assert "减少条目数量" in llm.calls[1][0]
+
+
+def test_agent_decision_accepts_long_complete_answer() -> None:
+    decision = AgentDecision(type="final_answer", content="完整内容" * 2000)
+
+    assert len(decision.content) == 8000
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,4 @@
-"""飞书卡片与 React 共用的待确认动作服务。"""
+"""飞书卡片使用的待确认动作服务。"""
 
 from __future__ import annotations
 

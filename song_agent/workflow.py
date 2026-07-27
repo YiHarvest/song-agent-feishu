@@ -22,13 +22,27 @@ from .agent.runtime import AgentLimits, ReActRuntime
 from .agent.tool_registry import AgentTool, ToolRegistry
 from .application.request_router import RequestRouter
 from .application.result_renderer import render_message
+from .attachments.models import (
+    AnalyzeImageInput,
+    AttachmentAccess,
+    ParseDocumentInput,
+    TranscribeAudioInput,
+)
+from .attachments.service import AttachmentService
+from .attachments.tools import AttachmentTools
 from .domain.intents import UserRequest
 from .domain.results import ApplicationResult
 from .feishu.cards import action_confirmation_markdown
 from .feishu.mcp import FeishuMcp
+from .feishu.media import FeishuMediaPermissionError
 from .feishu.oauth import FeishuOAuth
 from .feishu.openapi import FeishuOpenApi
 from .feishu.transport import FeishuTransport, clean_incoming_text
+from .media.vision_client import (
+    VisionBusyError,
+    VisionConnectionError,
+    VisionTimeoutError,
+)
 from .models import (
     DailyRecord,
     DailyReview,
@@ -80,6 +94,8 @@ class AgentWorkflow:
         search_mcp: SearchMcp,
         pending_actions: PendingActionService,
         audit: AuditService,
+        attachment_tools: AttachmentTools | None = None,
+        attachment_service: AttachmentService | None = None,
     ) -> None:
         self.planner = planner
         self.store = store
@@ -90,6 +106,8 @@ class AgentWorkflow:
         self.search_mcp = search_mcp
         self.pending_actions = pending_actions
         self.audit = audit
+        self.attachment_tools = attachment_tools
+        self.attachment_service = attachment_service
         self.logger = logging.getLogger(__name__)
         self._locks: dict[str, asyncio.Lock] = {}
         self.notify_outbox: Callable[[], None] = lambda: None
@@ -148,22 +166,126 @@ class AgentWorkflow:
             app_id=message.app_id,
         ):
             return
-        if message.message_type not in {"text", "post"}:
-            await self.transport.send_markdown(message.chat_id, "当前版本只接收文字消息。")
-            return
         text = clean_incoming_text(message.text)
-        if not text:
-            return
         self.logger.info(
-            "📩 收到用户消息 message_id=%s chat=%s user=%s type=%s "
-            "text_chars=%d content=%r",
+            "📩 收到用户消息 message_id=%s chat=%s user=%s "
+            "chat_type=%s message_type=%s text_chars=%d attachments=%d content=%r",
             message.message_id,
             message.chat_id,
             message.user_id,
             message.chat_type,
+            message.message_type,
             len(text),
+            len(message.attachments),
             text,
         )
+        attachment_context: dict[str, Any] = {}
+        attachment_response: str | None = None
+        if message.attachments:
+            if self.attachment_service is None:
+                await self.transport.send_markdown(message.chat_id, "附件功能当前不可用。")
+                return
+            attachment_kinds = {item.kind for item in message.attachments}
+            status = (
+                "⏳ 已收到图片，正在读取和分析…"
+                if attachment_kinds == {"image"}
+                else "⏳ 已收到附件，正在读取和处理…"
+            )
+            await self.transport.send_markdown(message.chat_id, status)
+            self.logger.info(
+                "📎 开始处理附件 message_id=%s kinds=%s count=%d",
+                message.message_id,
+                ",".join(sorted(attachment_kinds)),
+                len(message.attachments),
+            )
+            try:
+                prepared = await self.attachment_service.prepare(message, text)
+            except FeishuMediaPermissionError:
+                self.logger.warning(
+                    "附件预处理失败：飞书应用缺少 im:message:readonly 权限 "
+                    "message_id=%s",
+                    message.message_id,
+                )
+                await self.transport.send_markdown(
+                    message.chat_id,
+                    "图片/语音/文件读取权限未开通。请管理员在飞书开放平台为应用开通 "
+                    "**im:message:readonly**，发布新版本后重试。",
+                )
+                return
+            except VisionTimeoutError:
+                self.logger.warning(
+                    "附件图片理解超时 message_id=%s timeout=%ss retries=%d",
+                    message.message_id,
+                    self.oauth.settings.song_agent_vision_read_timeout_seconds,
+                    self.oauth.settings.song_agent_vision_max_retries,
+                )
+                await self.transport.send_markdown(
+                    message.chat_id,
+                    "图片已经收到，但图片理解服务响应超时；本次没有自动重试。"
+                    "请稍后重新发送。",
+                )
+                return
+            except (VisionBusyError, VisionConnectionError) as error:
+                self.logger.warning(
+                    "附件图片理解服务不可用 message_id=%s error_type=%s retries=%d",
+                    message.message_id,
+                    type(error).__name__,
+                    self.oauth.settings.song_agent_vision_max_retries,
+                )
+                await self.transport.send_markdown(
+                    message.chat_id,
+                    "图片已经收到，但图片理解服务当前繁忙；本次没有自动重试。"
+                    "请稍后重新发送。",
+                )
+                return
+            except Exception:
+                self.logger.exception(
+                    "附件预处理失败 message_id=%s",
+                    message.message_id,
+                )
+                await self.transport.send_markdown(
+                    message.chat_id,
+                    "附件处理失败，请检查格式、大小或稍后重试。",
+                )
+                return
+            text = prepared.text
+            attachment_context = prepared.context
+            attachment_response = prepared.direct_response
+            self.logger.info(
+                "✅ 附件处理完成 message_id=%s text_chars=%d direct_response=%s",
+                message.message_id,
+                len(text),
+                bool(attachment_response),
+            )
+        elif message.message_type not in {"text", "post"}:
+            await self.transport.send_markdown(message.chat_id, "当前版本只接收文字消息。")
+            return
+        if not text:
+            return
+        if attachment_response:
+            request = UserRequest(
+                identity=message.identity(self.oauth.settings.feishu_app_id),
+                text=text,
+                source="feishu",
+                chat_id=message.chat_id,
+                thread_id=message.thread_id or message.root_id,
+                message_id=message.message_id,
+                event_id=message.event_id,
+                context=attachment_context,
+            )
+            conversation_contexts = getattr(
+                self.request_router,
+                "conversation_contexts",
+                None,
+            )
+            if conversation_contexts is not None:
+                await conversation_contexts.record_user(request)
+                await conversation_contexts.record_assistant(
+                    request,
+                    attachment_response,
+                )
+            await self.transport.send_markdown(message.chat_id, attachment_response)
+            return
         date = self.planner.today()
         record = await self.store.get_record(
             message.chat_id,
@@ -215,6 +337,7 @@ class AgentWorkflow:
                     thread_id=message.thread_id or message.root_id,
                     message_id=message.message_id,
                     event_id=message.event_id,
+                    context=attachment_context,
                 )
             )
             if result.status == "awaiting_confirmation":
@@ -394,7 +517,83 @@ class AgentWorkflow:
                     category=category,
                 )
             )
+        attachment_tools = getattr(self, "attachment_tools", None)
+        if attachment_tools is not None:
+            attachment_definitions = (
+                (
+                    "attachments.analyze_image",
+                    "分析当前用户已上传的图片附件；只接受 attachment_id 和分析指令。",
+                    self._tool_analyze_image,
+                    AnalyzeImageInput.model_json_schema(),
+                ),
+                (
+                    "attachments.transcribe_audio",
+                    "转写当前用户已上传的语音附件；只接受 attachment_id 和语言。",
+                    self._tool_transcribe_audio,
+                    TranscribeAudioInput.model_json_schema(),
+                ),
+                (
+                    "attachments.parse_document",
+                    "解析当前用户已上传的文档附件；只接受 attachment_id 和解析指令。",
+                    self._tool_parse_document,
+                    ParseDocumentInput.model_json_schema(),
+                ),
+            )
+            for name, description, handler, arguments_schema in attachment_definitions:
+                registry.register(
+                    AgentTool(
+                        name=name,
+                        description=description,
+                        handler=handler,
+                        arguments_schema=arguments_schema,
+                        category="local",
+                    )
+                )
         return registry
+
+    def _attachment_access(self, context: AgentContext) -> AttachmentAccess:
+        identity = context.message.identity(self.oauth.settings.feishu_app_id)
+        return AttachmentAccess(
+            tenant_key=identity.tenant_key,
+            app_id=identity.app_id,
+            principal_id=identity.subject_id,
+        )
+
+    async def _tool_analyze_image(
+        self,
+        context: AgentContext,
+        arguments: dict[str, Any],
+    ) -> ToolResult:
+        assert self.attachment_tools is not None
+        result = await self.attachment_tools.analyze_image(
+            self._attachment_access(context),
+            AnalyzeImageInput.model_validate(arguments),
+        )
+        return await self.attachment_tools.as_tool_result(result, summary="图片已解析")
+
+    async def _tool_transcribe_audio(
+        self,
+        context: AgentContext,
+        arguments: dict[str, Any],
+    ) -> ToolResult:
+        assert self.attachment_tools is not None
+        result = await self.attachment_tools.transcribe_audio(
+            self._attachment_access(context),
+            TranscribeAudioInput.model_validate(arguments),
+        )
+        return await self.attachment_tools.as_tool_result(result, summary="语音已转写")
+
+    async def _tool_parse_document(
+        self,
+        context: AgentContext,
+        arguments: dict[str, Any],
+    ) -> ToolResult:
+        assert self.attachment_tools is not None
+        result = await self.attachment_tools.parse_document(
+            self._attachment_access(context),
+            ParseDocumentInput.model_validate(arguments),
+        )
+        return await self.attachment_tools.as_tool_result(result, summary="文档已解析")
 
     def _try_quick_response(self, text: str, record: DailyRecord | None, date: str) -> str | None:
         """
@@ -550,11 +749,15 @@ class AgentWorkflow:
                 payload=raw_result,
                 truncated=len(results) > max_results,
             )
-            context.metadata.setdefault("retrieved_context", {})[result_ref] = {
-                "summary": f"找到 {len(results)} 条与“{query}”相关的结果",
-                "items": raw_result["items"][:3],
-                "truncated": len(results) > 3,
-            }
+            _store_retrieved_context(
+                context.metadata,
+                result_ref,
+                {
+                    "summary": f"找到 {len(results)} 条与“{query}”相关的结果",
+                    "items": raw_result["items"][:3],
+                    "truncated": len(results) > 3,
+                },
+            )
 
             formatted_results = []
             for i, result in enumerate(results, 1):
@@ -608,7 +811,7 @@ class AgentWorkflow:
         if not result:
             return ToolResult(status="error", summary="工具结果不存在、已过期或无权访问")
         summary = _format_stored_tool_result(result)
-        context.metadata.setdefault("retrieved_context", {})[result_ref] = summary
+        _store_retrieved_context(context.metadata, result_ref, summary)
         return ToolResult(
             status="ok",
             summary=summary,
@@ -1236,6 +1439,28 @@ def _format_stored_tool_result(
         if len(candidate) <= max_length:
             parts.append(notice)
     return "\n\n".join(parts)
+
+
+def _store_retrieved_context(
+    metadata: dict[str, Any],
+    result_ref: str,
+    value: Any,
+) -> None:
+    """兼容附件列表与工具结果字典两种检索上下文。"""
+
+    retrieved = metadata.get("retrieved_context")
+    if isinstance(retrieved, list):
+        item = {"result_ref": result_ref}
+        if isinstance(value, dict):
+            item.update(value)
+        else:
+            item["content"] = value
+        retrieved.append(item)
+        return
+    if not isinstance(retrieved, dict):
+        retrieved = {}
+        metadata["retrieved_context"] = retrieved
+    retrieved[result_ref] = value
 
 
 def _shorten_at_boundary(text: str, max_length: int) -> str:

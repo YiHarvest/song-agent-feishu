@@ -57,6 +57,16 @@ class ConversationKey(BaseModel):
         )
 
 
+class IncomingAttachmentRef(BaseModel):
+    """飞书消息中的附件引用；仅传输层可见，Agent 不能直接使用资源键。"""
+
+    kind: Literal["image", "audio", "document", "unknown"]
+    resource_key: str
+    resource_type: Literal["image", "file"]
+    filename: str = ""
+    media_type: str = ""
+
+
 class IncomingMessage(BaseModel):
     message_id: str
     event_id: str = ""
@@ -72,6 +82,7 @@ class IncomingMessage(BaseModel):
     chat_type: Literal["p2p", "group"]
     message_type: str
     text: str
+    attachments: list[IncomingAttachmentRef] = Field(default_factory=list)
 
     def identity(self, default_app_id: str = "") -> FeishuIdentity:
         return FeishuIdentity(
@@ -102,6 +113,23 @@ class IncomingMessage(BaseModel):
                 self.thread_id or self.root_id or "_",
             )
         )
+
+
+class ApiChannelBinding(BaseModel):
+    binding_id: str
+    tenant_key: str
+    app_id: str
+    principal_id: str
+    provider: str = "feishu"
+    external_tenant_key: str
+    external_app_id: str
+    external_subject_id: str
+    external_open_id: str
+    external_user_id: str = ""
+    external_union_id: str = ""
+    external_chat_id: str
+    created_at: int
+    updated_at: int
 
 
 class PlanTask(BaseModel):

@@ -12,7 +12,7 @@ Song Agent 现已集成 `search-engine-tool-mcp`，支持通过 You.com 和 Tavi
 
 ```bash
 # SearXNG（推荐，免费自托管）
-SEARXNG_BASE_URL="http://127.0.0.1:8080"
+SEARXNG_BASE_URL="http://0.0.0.0:8080"
 
 # TalorData（推荐，高质量 SERP API）
 TALORDATA_API_KEY="your_talordata_api_key"

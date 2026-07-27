@@ -6,7 +6,7 @@ import pytest
 from song_agent.agent.context import AgentContext
 from song_agent.agent.context_builder import AgentContextBuilder
 from song_agent.agent.models import AgentDecision, ToolResult
-from song_agent.agent.runtime import AgentLimits, ReActRuntime
+from song_agent.agent.runtime import AgentLimits, ReActRuntime, _normalize_tool_decision
 from song_agent.agent.tool_registry import AgentTool, ToolRegistry
 from song_agent.config import Settings
 from song_agent.llm import LLMOutputTruncatedError
@@ -96,6 +96,67 @@ def test_context_builder_preserves_runtime_tool_summary() -> None:
     assert "plans.save_draft: 完成" not in summary
 
 
+def test_context_builder_exposes_resolved_reference() -> None:
+    ctx = context()
+    ctx.metadata["reference_context"] = {
+        "role": "assistant",
+        "content": "需要记录的原句。",
+    }
+    ctx.metadata["document_context"] = {
+        "action": "append",
+        "title": None,
+        "target_title": "每日记录",
+        "markdown": "需要记录的原句。",
+    }
+
+    prompt = AgentContextBuilder().build_user_message(ctx)
+
+    assert "已解析指代" in prompt
+    assert "需要记录的原句" in prompt
+    assert "已解析文档操作" in prompt
+    assert "target_title" in prompt
+
+
+def test_context_builder_keeps_image_analysis_for_follow_up() -> None:
+    ctx = context()
+    analysis = "图中流程说明：" + "数据校验和人工复核。" * 30
+    ctx.metadata["conversation_context"] = [
+        {"role": "assistant", "content": analysis}
+    ]
+
+    prompt = AgentContextBuilder().build_user_message(ctx)
+
+    assert analysis in prompt
+
+
+def test_context_builder_marks_attachment_as_already_processed() -> None:
+    ctx = context()
+    ctx.metadata["retrieved_context"] = [
+        {
+            "source_type": "audio",
+            "attachment_id": "att_" + "a" * 32,
+            "transcript": "杭州萧山今天天气怎么样",
+        }
+    ]
+
+    prompt = AgentContextBuilder().build_user_message(ctx)
+
+    assert "附件已在进入 Agent 前完成解析" in prompt
+    assert "禁止再次调用图片、语音或文档解析工具" in prompt
+
+
+def test_context_builder_hides_attachment_instructions_without_current_attachment() -> None:
+    prompt = AgentContextBuilder().build_system_prompt(
+        context(),
+        tool_schemas=[],
+    )
+
+    assert "attachments.analyze_image" not in prompt
+    assert '"type":"tool_call"' not in prompt
+    assert "通用知识、概念解释、利弊分析" in prompt
+    assert "能力不限于日程、提醒、文档和计划" in prompt
+
+
 def test_context_builder_preserves_nested_plan_tool_schema() -> None:
     workflow = object.__new__(AgentWorkflow)
     plan_tool = workflow._build_tool_registry().get("plans.save_draft")
@@ -146,6 +207,56 @@ async def test_runtime_uses_final_limit_and_compacts_after_truncation() -> None:
         configured.llm_final_max_tokens,
     ]
     assert "减少条目数量" in llm.calls[1][0]
+
+
+@pytest.mark.asyncio
+async def test_runtime_repairs_false_general_knowledge_scope_refusal() -> None:
+    class ScopeRefusingLlm:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def generate(self, schema, system, user, **kwargs):
+            del schema, user, kwargs
+            self.calls.append(system)
+            if len(self.calls) == 1:
+                return AgentDecision(
+                    type="final_answer",
+                    content=(
+                        "我无法回答这个问题。我的能力范围是管理日程和提醒、"
+                        "创建和编辑文档、制定和复盘每日计划。"
+                        "数据授权问题不在我的能力范围内，请提出其他我能处理的问题。"
+                    ),
+                )
+            return AgentDecision(
+                type="final_answer",
+                content="数据授权重要，因为它明确访问边界，保护隐私并支持责任追踪。",
+            )
+
+    llm = ScopeRefusingLlm()
+    configured = settings()
+    agent = ReActRuntime(
+        llm,
+        ToolRegistry(),
+        ToolPolicyGuard(),
+        AgentLimits(),
+        settings=configured,
+    )
+    ctx = context()
+    ctx.user_text = "数据授权的重要性是什么？"
+    ctx.metadata["retrieved_context"] = [
+        {
+            "source_type": "audio",
+            "attachment_id": "att_" + "a" * 32,
+            "transcript": ctx.user_text,
+        }
+    ]
+
+    result = await agent.run(ctx)
+
+    assert result.status == "completed"
+    assert result.response.startswith("数据授权重要")
+    assert len(llm.calls) == 2
+    assert "错误地把通用知识问题判为超出能力范围" in llm.calls[1]
 
 
 def test_agent_decision_accepts_long_complete_answer() -> None:
@@ -395,6 +506,116 @@ def test_planning_phrase_selects_plan_tool_schema() -> None:
         "plans.save_draft",
         "reviews.save",
     }
+
+
+def test_image_follow_up_does_not_expose_attachment_tool_without_current_id() -> None:
+    registry = ToolRegistry()
+
+    async def handler(ctx: AgentContext, arguments: dict[str, Any]) -> ToolResult:
+        del ctx, arguments
+        return ToolResult(status="ok", summary="never")
+
+    registry.register(
+        AgentTool(
+            name="attachments.analyze_image",
+            description="analyze image",
+            handler=handler,
+        )
+    )
+    agent = ReActRuntime(
+        FakeLlm([]),
+        registry,
+        ToolPolicyGuard(),
+        AgentLimits(),
+    )
+    ctx = context()
+    ctx.user_text = "这个图中的流程你觉得合理吗"
+    ctx.metadata["conversation_context"] = [
+        {"role": "assistant", "content": "图中包含数据校验和人工复核。"}
+    ]
+
+    capabilities = agent._infer_capabilities(ctx, [])
+    schemas = registry.schemas_for(ctx, capabilities)
+
+    assert "attachments" not in capabilities
+    assert schemas == []
+
+
+def test_processed_audio_does_not_reexpose_attachment_tools() -> None:
+    registry = ToolRegistry()
+
+    async def handler(ctx: AgentContext, arguments: dict[str, Any]) -> ToolResult:
+        del ctx, arguments
+        return ToolResult(status="ok", summary="ok")
+
+    for name in (
+        "attachments.analyze_image",
+        "attachments.transcribe_audio",
+        "attachments.parse_document",
+    ):
+        registry.register(
+            AgentTool(
+                name=name,
+                description="process attachment",
+                handler=handler,
+            )
+        )
+    agent = ReActRuntime(
+        FakeLlm([]),
+        registry,
+        ToolPolicyGuard(),
+        AgentLimits(),
+    )
+    ctx = context()
+    ctx.user_text = "杭州萧山今天天气怎么样"
+    ctx.metadata["retrieved_context"] = [
+        {
+            "source_type": "audio",
+            "attachment_id": "att_" + "a" * 32,
+            "transcript": "杭州萧山今天天气怎么样",
+        }
+    ]
+
+    capabilities = agent._infer_capabilities(ctx, [])
+    schemas = registry.schemas_for(ctx, capabilities)
+
+    assert capabilities == {"websearch"}
+    assert schemas == []
+
+
+def test_document_capability_does_not_expose_attachment_parsers() -> None:
+    workflow = object.__new__(AgentWorkflow)
+    registry = workflow._build_tool_registry()
+    agent = ReActRuntime(
+        FakeLlm([]),
+        registry,
+        ToolPolicyGuard(),
+        AgentLimits(),
+    )
+    ctx = context()
+    ctx.user_text = "把已解析内容写入文档"
+
+    capabilities = agent._infer_capabilities(ctx, [])
+    schema_names = {
+        schema["name"] for schema in registry.schemas_for(ctx, capabilities)
+    }
+
+    assert "documents" in capabilities
+    assert not any(name.startswith("attachments.") for name in schema_names)
+
+
+def test_invisible_attachment_tool_call_is_blocked() -> None:
+    ctx = context()
+    decision = AgentDecision(
+        type="tool_call",
+        tool_name="attachments.analyze_image",
+        arguments={"attachments": []},
+    )
+
+    normalized = _normalize_tool_decision(ctx, decision, [], [])
+
+    assert normalized.type == "ask_user"
+    assert normalized.tool_name == ""
 
 
 @pytest.mark.parametrize(

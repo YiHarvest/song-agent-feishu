@@ -101,6 +101,7 @@ class ToolRegistry:
             "documents": {"documents"},
             "websearch": {"websearch"},
             "tool_results": {"websearch"},
+            "attachments": {"attachments"},
             "user_preferences": {"preferences"},
             "ask_user": {"interaction"},
             "final_answer": {"answer"},

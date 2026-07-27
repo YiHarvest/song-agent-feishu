@@ -92,4 +92,7 @@ class UserRequest(BaseModel):
     thread_id: str = ""
     message_id: str = ""
     event_id: str = ""
+    api_metadata: dict[str, Any] = Field(default_factory=dict)
+    delivery_channel: Literal["api", "feishu"] | None = None
+    delivery_binding_id: str | None = None
     context: dict[str, Any] = Field(default_factory=dict)

@@ -3,8 +3,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from song_agent.attachments.service import PreparedAttachmentMessage
 from song_agent.domain.results import ApplicationResult
-from song_agent.models import IncomingMessage
+from song_agent.media.vision_client import VisionBusyError, VisionTimeoutError
+from song_agent.models import IncomingAttachmentRef, IncomingMessage
 from song_agent.workflow import AgentWorkflow
 
 
@@ -49,6 +51,23 @@ class Router:
         return ApplicationResult(status="ok", message="处理完成")
 
 
+class ConversationContexts:
+    def __init__(self) -> None:
+        self.recorded: list[tuple[str, str]] = []
+
+    async def record_user(self, request) -> None:
+        self.recorded.append(("user", request.text))
+
+    async def record_assistant(self, request, content) -> None:
+        del request
+        self.recorded.append(("assistant", content))
+
+
+class ContextRecordingRouter(Router):
+    def __init__(self) -> None:
+        self.conversation_contexts = ConversationContexts()
+
+
 class BatchRouter:
     def __init__(self, action_ids):
         self.action_ids = action_ids
@@ -61,6 +80,28 @@ class BatchRouter:
             action_id=self.action_ids[0],
             data={"action_ids": self.action_ids},
         )
+
+
+class DirectAttachmentService:
+    async def prepare(self, message, text):
+        del message, text
+        return PreparedAttachmentMessage(
+            text="这是什么",
+            context={"source_type": "attachment"},
+            direct_response="图片显示数据库连接超时。",
+        )
+
+
+class TimeoutAttachmentService:
+    async def prepare(self, message, text):
+        del message, text
+        raise VisionTimeoutError("timeout")
+
+
+class BusyAttachmentService:
+    async def prepare(self, message, text):
+        del message, text
+        raise VisionBusyError("busy")
 
 
 def incoming(text: str = "杭州萧山天气怎么样") -> IncomingMessage:
@@ -116,4 +157,96 @@ async def test_batch_result_sends_each_confirmation_card(action_count: int) -> N
 
     assert instance.transport.confirmations == [
         ("chat-1", action_id) for action_id in action_ids
+    ]
+
+
+@pytest.mark.asyncio
+async def test_direct_attachment_answer_skips_router() -> None:
+    instance = workflow()
+    instance.attachment_service = DirectAttachmentService()
+    instance.request_router = ContextRecordingRouter()
+    media = incoming("").model_copy(
+        update={
+            "message_type": "image",
+            "attachments": [
+                IncomingAttachmentRef(
+                    kind="image",
+                    resource_key="image-key",
+                    resource_type="image",
+                    filename="image.png",
+                )
+            ],
+        }
+    )
+
+    await instance._handle(media)
+
+    assert instance.transport.messages == [
+        ("chat-1", "⏳ 已收到图片，正在读取和分析…"),
+        ("chat-1", "图片显示数据库连接超时。"),
+    ]
+    assert instance.request_router.conversation_contexts.recorded == [
+        ("user", "这是什么"),
+        ("assistant", "图片显示数据库连接超时。"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_image_timeout_is_reported_without_generic_failure() -> None:
+    instance = workflow()
+    instance.attachment_service = TimeoutAttachmentService()
+    instance.oauth.settings.song_agent_vision_read_timeout_seconds = 45
+    instance.oauth.settings.song_agent_vision_max_retries = 0
+    media = incoming("").model_copy(
+        update={
+            "message_type": "image",
+            "attachments": [
+                IncomingAttachmentRef(
+                    kind="image",
+                    resource_key="image-key",
+                    resource_type="image",
+                    filename="image.png",
+                )
+            ],
+        }
+    )
+
+    await instance._handle(media)
+
+    assert instance.transport.messages == [
+        ("chat-1", "⏳ 已收到图片，正在读取和分析…"),
+        (
+            "chat-1",
+            "图片已经收到，但图片理解服务响应超时；本次没有自动重试。请稍后重新发送。",
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_image_provider_overload_is_reported_without_traceback() -> None:
+    instance = workflow()
+    instance.attachment_service = BusyAttachmentService()
+    instance.oauth.settings.song_agent_vision_max_retries = 0
+    media = incoming("").model_copy(
+        update={
+            "message_type": "image",
+            "attachments": [
+                IncomingAttachmentRef(
+                    kind="image",
+                    resource_key="image-key",
+                    resource_type="image",
+                    filename="image.png",
+                )
+            ],
+        }
+    )
+
+    await instance._handle(media)
+
+    assert instance.transport.messages == [
+        ("chat-1", "⏳ 已收到图片，正在读取和分析…"),
+        (
+            "chat-1",
+            "图片已经收到，但图片理解服务当前繁忙；本次没有自动重试。请稍后重新发送。",
+        ),
     ]

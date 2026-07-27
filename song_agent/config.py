@@ -45,13 +45,75 @@ class Settings(BaseSettings):
     ydc_api_key: str = ""
     tavily_api_key: str = ""
 
-    public_base_url: HttpUrl = HttpUrl("http://127.0.0.1:45837")
+    public_base_url: HttpUrl = HttpUrl("http://0.0.0.0:45837")
     port: int = Field(default=45837, ge=1, le=65535)
     timezone: str = "Asia/Shanghai"
 
     llm_base_url: HttpUrl
     llm_api_key: str = Field(min_length=1)
     llm_model: str = Field(min_length=1)
+
+    # 对外 OpenAI 兼容 API（仅文本）。
+    song_agent_api_enabled: bool = False
+    song_agent_api_model_id: str = "song-agent-2.1"
+    song_agent_api_key_name: str = "default"
+    song_agent_api_key: SecretStr | None = None
+    song_agent_api_default_tenant: str = "default"
+    song_agent_api_app_id: str = "song-agent-api"
+    song_agent_api_rate_limit_per_minute: int = Field(default=60, ge=1, le=10_000)
+    song_agent_api_max_messages: int = Field(default=100, ge=1, le=1000)
+    song_agent_api_max_message_chars: int = Field(default=50_000, ge=1, le=1_000_000)
+    song_agent_api_max_total_chars: int = Field(default=200_000, ge=1, le=2_000_000)
+    song_agent_api_sync_timeout_seconds: int = Field(default=180, ge=10, le=600)
+    song_agent_api_idempotency_ttl_seconds: int = Field(default=86_400, ge=60, le=604_800)
+    song_agent_api_binding_code_ttl_seconds: int = Field(default=600, ge=60, le=3600)
+    song_agent_api_health_details_enabled: bool = False
+
+    # 飞书附件、图片理解、语音识别和文件解析。
+    song_agent_attachments_enabled: bool = False
+    song_agent_attachment_dir: Path = Path(".data/attachments")
+    song_agent_attachment_temp_dir: Path = Path(".data/tmp")
+    song_agent_attachment_ttl_seconds: int = Field(default=2_592_000, ge=3600)
+    song_agent_attachment_max_files_per_message: int = Field(default=5, ge=1, le=20)
+    song_agent_attachment_max_total_mb_per_message: int = Field(default=150, ge=1, le=1000)
+    song_agent_attachment_download_timeout_seconds: int = Field(default=90, ge=5, le=600)
+
+    song_agent_vision_enabled: bool = False
+    song_agent_vision_base_url: HttpUrl = HttpUrl("https://api.moonshot.cn/v1")
+    song_agent_vision_api_key: SecretStr | None = None
+    song_agent_vision_model: str = "kimi-k2.6"
+    song_agent_vision_connect_timeout_seconds: float = Field(default=10, ge=1, le=60)
+    song_agent_vision_read_timeout_seconds: float = Field(default=45, ge=10, le=600)
+    song_agent_vision_max_retries: int = Field(default=0, ge=0, le=2)
+    song_agent_vision_max_tokens: int = Field(default=1600, ge=200, le=4000)
+    song_agent_vision_thinking_enabled: bool = False
+    song_agent_vision_max_image_mb: int = Field(default=20, ge=1, le=100)
+    song_agent_vision_max_images_per_message: int = Field(default=4, ge=1, le=20)
+
+    song_agent_asr_enabled: bool = False
+    song_agent_asr_base_url: HttpUrl = HttpUrl("http://183.147.142.111:25570")
+    song_agent_asr_path: str = "/api/v1/asr"
+    song_agent_asr_default_language: str = "auto"
+    song_agent_asr_connect_timeout_seconds: float = Field(default=10, ge=1, le=60)
+    song_agent_asr_read_timeout_seconds: float = Field(default=300, ge=10, le=900)
+    song_agent_asr_max_audio_mb: int = Field(default=100, ge=1, le=500)
+
+    song_agent_document_parser_enabled: bool = False
+    song_agent_document_parser_provider: str = "mineru_vl"
+    song_agent_document_parse_timeout_seconds: int = Field(default=300, ge=10, le=3600)
+    song_agent_document_max_file_mb: int = Field(default=50, ge=1, le=500)
+    song_agent_document_max_context_chars: int = Field(default=4000, ge=500, le=20_000)
+    song_agent_document_max_preview_chars: int = Field(default=2000, ge=200, le=10_000)
+    song_agent_mineru_vl_base_url: HttpUrl = HttpUrl("http://183.147.142.111:63359/v1")
+    song_agent_mineru_vl_model_name: str = ""
+    song_agent_mineru_vl_server_headers: str = "{}"
+    song_agent_mineru_vl_connect_timeout_seconds: int = Field(default=10, ge=1, le=60)
+    song_agent_mineru_vl_read_timeout_seconds: int = Field(default=300, ge=10, le=900)
+    song_agent_mineru_vl_pdf_scale: float = Field(default=2.0, ge=1.0, le=4.0)
+    song_agent_mineru_vl_max_pages: int = Field(default=100, ge=1, le=500)
+    song_agent_mineru_vl_page_concurrency: int = Field(default=2, ge=1, le=8)
+    song_agent_mineru_vl_region_concurrency: int = Field(default=4, ge=1, le=32)
+    song_agent_mineru_vl_max_retries: int = Field(default=1, ge=0, le=3)
 
     # LLM 超时配置（细粒度）
     llm_connect_timeout_seconds: float = Field(default=10.0, ge=1.0, le=30.0)
@@ -130,6 +192,15 @@ class Settings(BaseSettings):
         return str(self.llm_base_url).rstrip("/")
 
     @property
+    def agent_api_configured(self) -> bool:
+        return bool(
+            self.song_agent_api_enabled
+            and self.song_agent_api_key is not None
+            and self.song_agent_api_key.get_secret_value()
+            and self.song_agent_api_model_id
+        )
+
+    @property
     def required_oauth_scopes(self) -> tuple[str, ...]:
         return (
             "calendar:calendar",
@@ -141,6 +212,7 @@ class Settings(BaseSettings):
             "docx:document",
             "drive:drive",
             "search:docs:read",
+            "im:message:readonly",
         )
 
     @property

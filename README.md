@@ -122,7 +122,7 @@ uv run song-agent-rotate-keys
 ```bash
 uv run ruff check song_agent tests
 uv run pytest -q
-curl http://127.0.0.1:45837/health
+curl http://0.0.0.0:45837/health
 ```
 
 数据保存在 `.data/song-agent.db`，权限为 `0600`。旧 `.data/state.json` 仅在首次迁移时读取，迁移后不会继续写入。

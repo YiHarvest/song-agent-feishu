@@ -14,6 +14,7 @@ import aiosqlite
 
 from .db.migrations import rotate_oauth_tokens, run_migrations
 from .models import (
+    ApiChannelBinding,
     DailyRecord,
     DocumentBinding,
     FeishuIdentity,
@@ -365,6 +366,69 @@ CREATE TABLE IF NOT EXISTS tool_results (
     expires_at INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS attachments (
+    attachment_id TEXT PRIMARY KEY,
+    tenant_key TEXT NOT NULL,
+    app_id TEXT NOT NULL,
+    principal_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    source_message_id TEXT NOT NULL,
+    source_resource_key TEXT NOT NULL DEFAULT '',
+    attachment_kind TEXT NOT NULL CHECK (
+        attachment_kind IN ('image', 'audio', 'document', 'unknown')
+    ),
+    filename TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    storage_path TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (
+        status IN ('downloading', 'ready', 'parsing', 'parsed', 'failed', 'expired')
+    ),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    expires_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS api_idempotency (
+    tenant_key TEXT NOT NULL,
+    principal_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('processing', 'completed')),
+    response_json TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY (tenant_key, principal_id, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS api_binding_codes (
+    code_hash TEXT PRIMARY KEY,
+    tenant_key TEXT NOT NULL,
+    app_id TEXT NOT NULL,
+    principal_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    consumed_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS api_channel_bindings (
+    binding_id TEXT PRIMARY KEY,
+    tenant_key TEXT NOT NULL,
+    app_id TEXT NOT NULL,
+    principal_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    external_tenant_key TEXT NOT NULL,
+    external_app_id TEXT NOT NULL,
+    external_subject_id TEXT NOT NULL,
+    external_open_id TEXT NOT NULL,
+    external_user_id TEXT NOT NULL DEFAULT '',
+    external_union_id TEXT NOT NULL DEFAULT '',
+    external_chat_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_processed_events_time ON processed_events(processed_at);
 CREATE INDEX IF NOT EXISTS idx_pending_actions_expiry ON pending_actions(status, expires_at);
 CREATE INDEX IF NOT EXISTS idx_action_outbox_ready ON action_outbox(status, available_at);
@@ -375,6 +439,12 @@ CREATE INDEX IF NOT EXISTS idx_conversation_messages_recent
 ON conversation_messages(tenant_key, app_id, principal_id, session_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_user_memories_principal
 ON user_memories(tenant_key, app_id, principal_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_attachments_owner
+ON attachments(tenant_key, app_id, principal_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_attachments_message
+ON attachments(tenant_key, source_message_id);
+CREATE INDEX IF NOT EXISTS idx_api_bindings_owner
+ON api_channel_bindings(tenant_key, app_id, principal_id, created_at);
 """
 
 
@@ -2723,6 +2793,247 @@ class SqliteStore:
             "truncated": bool(row["truncated"]),
             "created_at": row["created_at"],
         }
+
+    async def reserve_api_request(
+        self,
+        *,
+        tenant_key: str,
+        principal_id: str,
+        idempotency_key: str,
+        request_hash: str,
+        ttl_seconds: int,
+    ) -> tuple[str, dict[str, Any] | None]:
+        now = int(time.time())
+        async with self._transaction_lock:
+            await self.db.execute("BEGIN IMMEDIATE")
+            try:
+                row = await (
+                    await self.db.execute(
+                        """
+                        SELECT request_hash, status, response_json, expires_at
+                        FROM api_idempotency
+                        WHERE tenant_key = ? AND principal_id = ? AND idempotency_key = ?
+                        """,
+                        (tenant_key, principal_id, idempotency_key),
+                    )
+                ).fetchone()
+                if row and row["expires_at"] <= now:
+                    await self.db.execute(
+                        """
+                        DELETE FROM api_idempotency
+                        WHERE tenant_key = ? AND principal_id = ? AND idempotency_key = ?
+                        """,
+                        (tenant_key, principal_id, idempotency_key),
+                    )
+                    row = None
+                if row:
+                    await self.db.commit()
+                    if row["request_hash"] != request_hash:
+                        return "conflict", None
+                    if row["status"] == "completed":
+                        return "replay", json.loads(row["response_json"])
+                    return "in_progress", None
+                await self.db.execute(
+                    """
+                    INSERT INTO api_idempotency(
+                        tenant_key, principal_id, idempotency_key, request_hash,
+                        status, response_json, created_at, expires_at
+                    ) VALUES (?, ?, ?, ?, 'processing', '', ?, ?)
+                    """,
+                    (
+                        tenant_key,
+                        principal_id,
+                        idempotency_key,
+                        request_hash,
+                        now,
+                        now + ttl_seconds,
+                    ),
+                )
+                await self.db.commit()
+                return "reserved", None
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def complete_api_request(
+        self,
+        *,
+        tenant_key: str,
+        principal_id: str,
+        idempotency_key: str,
+        response: dict[str, Any],
+    ) -> None:
+        await self.db.execute(
+            """
+            UPDATE api_idempotency SET status = 'completed', response_json = ?
+            WHERE tenant_key = ? AND principal_id = ? AND idempotency_key = ?
+              AND status = 'processing'
+            """,
+            (
+                json.dumps(response, ensure_ascii=False, separators=(",", ":")),
+                tenant_key,
+                principal_id,
+                idempotency_key,
+            ),
+        )
+        await self.db.commit()
+
+    async def abandon_api_request(
+        self,
+        *,
+        tenant_key: str,
+        principal_id: str,
+        idempotency_key: str,
+    ) -> None:
+        await self.db.execute(
+            """
+            DELETE FROM api_idempotency
+            WHERE tenant_key = ? AND principal_id = ? AND idempotency_key = ?
+              AND status = 'processing'
+            """,
+            (tenant_key, principal_id, idempotency_key),
+        )
+        await self.db.commit()
+
+    async def create_api_binding_code(
+        self,
+        *,
+        code_hash: str,
+        tenant_key: str,
+        app_id: str,
+        principal_id: str,
+        ttl_seconds: int,
+    ) -> int:
+        now = int(time.time())
+        expires_at = now + ttl_seconds
+        await self.db.execute(
+            """
+            INSERT INTO api_binding_codes(
+                code_hash, tenant_key, app_id, principal_id,
+                created_at, expires_at, consumed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL)
+            """,
+            (code_hash, tenant_key, app_id, principal_id, now, expires_at),
+        )
+        await self.db.commit()
+        return expires_at
+
+    async def redeem_api_binding_code(
+        self,
+        *,
+        code_hash: str,
+        identity: FeishuIdentity,
+        chat_id: str,
+    ) -> ApiChannelBinding | None:
+        now = int(time.time())
+        async with self._transaction_lock:
+            await self.db.execute("BEGIN IMMEDIATE")
+            try:
+                row = await (
+                    await self.db.execute(
+                        """
+                        SELECT tenant_key, app_id, principal_id
+                        FROM api_binding_codes
+                        WHERE code_hash = ? AND consumed_at IS NULL AND expires_at > ?
+                        """,
+                        (code_hash, now),
+                    )
+                ).fetchone()
+                if not row:
+                    await self.db.commit()
+                    return None
+                binding = ApiChannelBinding(
+                    binding_id=f"binding_{uuid.uuid4().hex}",
+                    tenant_key=row["tenant_key"],
+                    app_id=row["app_id"],
+                    principal_id=row["principal_id"],
+                    provider="feishu",
+                    external_tenant_key=identity.tenant_key,
+                    external_app_id=identity.app_id,
+                    external_subject_id=identity.subject_id,
+                    external_open_id=identity.open_id,
+                    external_user_id=identity.user_id,
+                    external_union_id=identity.union_id,
+                    external_chat_id=chat_id,
+                    created_at=now,
+                    updated_at=now,
+                )
+                await self.db.execute(
+                    "UPDATE api_binding_codes SET consumed_at = ? WHERE code_hash = ?",
+                    (now, code_hash),
+                )
+                await self.db.execute(
+                    """
+                    INSERT INTO api_channel_bindings(
+                        binding_id, tenant_key, app_id, principal_id, provider,
+                        external_tenant_key, external_app_id, external_subject_id,
+                        external_open_id, external_user_id, external_union_id,
+                        external_chat_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    tuple(binding.model_dump().values()),
+                )
+                await self.db.commit()
+                return binding
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def get_api_channel_binding(
+        self,
+        binding_id: str,
+        *,
+        tenant_key: str,
+        app_id: str,
+        principal_id: str,
+    ) -> ApiChannelBinding | None:
+        row = await (
+            await self.db.execute(
+                """
+                SELECT * FROM api_channel_bindings
+                WHERE binding_id = ? AND tenant_key = ? AND app_id = ? AND principal_id = ?
+                """,
+                (binding_id, tenant_key, app_id, principal_id),
+            )
+        ).fetchone()
+        return ApiChannelBinding.model_validate(dict(row)) if row else None
+
+    async def list_api_channel_bindings(
+        self,
+        *,
+        tenant_key: str,
+        app_id: str,
+        principal_id: str,
+    ) -> list[ApiChannelBinding]:
+        rows = await (
+            await self.db.execute(
+                """
+                SELECT * FROM api_channel_bindings
+                WHERE tenant_key = ? AND app_id = ? AND principal_id = ?
+                ORDER BY created_at, binding_id
+                """,
+                (tenant_key, app_id, principal_id),
+            )
+        ).fetchall()
+        return [ApiChannelBinding.model_validate(dict(row)) for row in rows]
+
+    async def delete_api_channel_binding(
+        self,
+        binding_id: str,
+        *,
+        tenant_key: str,
+        app_id: str,
+        principal_id: str,
+    ) -> bool:
+        cursor = await self.db.execute(
+            """
+            DELETE FROM api_channel_bindings
+            WHERE binding_id = ? AND tenant_key = ? AND app_id = ? AND principal_id = ?
+            """,
+            (binding_id, tenant_key, app_id, principal_id),
+        )
+        await self.db.commit()
+        return cursor.rowcount == 1
 
 
 def _normalize_legacy_state(value: dict[str, Any]) -> dict[str, Any]:

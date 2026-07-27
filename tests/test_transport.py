@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
+
+import pytest
 
 from song_agent.feishu import transport
 from song_agent.feishu.mcp import markdown_to_text_blocks
@@ -51,3 +54,27 @@ def test_websocket_client_uses_thread_owned_event_loop() -> None:
     assert not thread.is_alive()
     assert captured["running"] is captured["sdk"]
     assert captured["running"].is_closed()
+
+
+@pytest.mark.asyncio
+async def test_transport_close_drains_inflight_message_tasks() -> None:
+    instance = object.__new__(transport.FeishuTransport)
+    instance._accepting = True
+    instance._futures = set()
+    instance._futures_lock = threading.Lock()
+    instance.logger = logging.getLogger("test.transport.close")
+    release = asyncio.Event()
+
+    async def handler() -> None:
+        await release.wait()
+
+    future = asyncio.run_coroutine_threadsafe(handler(), asyncio.get_running_loop())
+    instance._futures.add(future)
+    future.add_done_callback(instance._finish_future)
+
+    closing = asyncio.create_task(instance.close(timeout_seconds=1))
+    await asyncio.sleep(0)
+    assert instance._accepting is False
+    release.set()
+    await closing
+    assert not instance._futures

@@ -334,9 +334,39 @@ class ReActRuntime:
                 tool_schema_count=len(tool_schemas),
             )
 
-        return _normalize_tool_decision(
+        normalized = _normalize_tool_decision(
             context,
             decision,
+            tool_schemas,
+            observations,
+        )
+        if not _is_false_scope_refusal(normalized):
+            return normalized
+
+        self.logger.warning(
+            "模型错误限制通用问答能力，重新生成 run_id=%s step=%d",
+            context.run_id,
+            step_index,
+        )
+        budget.record_llm_request()
+        budget.ensure_can_call_llm(
+            reserve_seconds=self.settings.agent_finish_reserve_seconds
+        )
+        repaired = await self.llm.generate(
+            AgentDecision,
+            system_prompt
+            + "\n\n上次回答错误地把通用知识问题判为超出能力范围。"
+            "你能回答普通知识、概念和分析问题。现在直接、实质性回答用户问题，"
+            "不得介绍自身能力范围。",
+            user_message,
+            run_id=context.run_id,
+            step_index=step_index,
+            max_tokens=self.settings.llm_final_max_tokens,
+            tool_schema_count=len(tool_schemas),
+        )
+        return _normalize_tool_decision(
+            context,
+            repaired,
             tool_schemas,
             observations,
         )
@@ -676,6 +706,11 @@ def _system_prompt(registry: ToolRegistry) -> str:
             "- 计划、复盘和文档正文都由本次 decision 生成；工具不会再次调用模型补全。",
             "- 普通问候、说明和无需工具的问题直接使用 final_answer，不调用工具。",
             "",
+            "## 能力说明",
+            "- 你可以识别图片：当用户发送图片时，使用 attachments.analyze_image 工具分析图片内容",
+            "- 你可以转写语音：当用户发送语音时，使用 attachments.transcribe_audio 工具转写",
+            "- 你可以解析文档：当用户发送文档时，使用 attachments.parse_document 工具解析",
+            "",
             "## 业务规则",
             "- 计划只拆分用户明确提到的事项：A=关键必做，B=重要，C=辅助生活；",
             "  未明确时间必须为 null，相对时间依据 current_time，周期词映射 repeat。",
@@ -750,7 +785,15 @@ def _normalize_tool_decision(
         and _needs_websearch(context.user_text)
     ):
         return _websearch_decision(context, decision.arguments)
-    return decision
+    if decision.tool_name.startswith("attachments."):
+        content = "当前请求没有可用附件；请重新发送附件，或基于最近对话补充问题。"
+    else:
+        content = "当前请求不能使用该工具；请补充必要信息或换一种描述。"
+    return AgentDecision(
+        type="ask_user",
+        content=content,
+        decision_summary=f"阻止调用不可见工具 {decision.tool_name}",
+    )
 
 
 def _needs_websearch(text: str) -> bool:
@@ -776,6 +819,19 @@ def _needs_websearch(text: str) -> bool:
     )
     lowered = text.lower()
     return any(term in lowered for term in terms)
+
+
+def _is_false_scope_refusal(decision: AgentDecision) -> bool:
+    if decision.type != "final_answer":
+        return False
+    content = decision.content
+    return bool(
+        (
+            "能力范围" in content
+            and any(marker in content for marker in ("无法回答", "不能回答", "不在"))
+        )
+        or "请提出其他我能处理的问题" in content
+    )
 
 
 def _websearch_decision(

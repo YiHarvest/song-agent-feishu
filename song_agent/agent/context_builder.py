@@ -21,6 +21,7 @@ class ContextConfig:
     """上下文配置"""
 
     max_history_messages: int = 10
+    max_history_message_chars: int = 2000
     max_tool_results: int = 5
     max_document_chars: int = 2000
     max_plan_chars: int = 500
@@ -77,15 +78,21 @@ class AgentContextBuilder:
             "",
             "## 核心规则",
             "- 需真实操作必须调用工具，禁止声称已执行未调用的操作",
-            "- 只能调用“可用工具”中列出的精确工具名，禁止自造工具名",
+            "- 只能调用 可用工具 中列出的精确工具名，禁止自造工具名",
             "- 工具参数必须一次性完整给出",
             "- 普通问候/说明直接 final_answer",
+            "- 通用知识、概念解释、利弊分析、写作和建议直接 final_answer",
+            "- 能力不限于日程、提醒、文档和计划；禁止用“超出能力范围”拒绝普通知识问题",
+            "- 语音转写文本与用户直接输入的文字等同，必须回答其中问题",
             "",
             "## 其他业务规则",
             "- 计划：A=关键必做，B=重要，C=辅助生活；任务名使用 title，不得使用 name",
             "- 计划时间只用 HH:MM；未明确时间=null；有开始时间但无时长时补合理结束时间",
             "- 复盘：只依据明确反馈，未提到任务标记 unconfirmed",
             "- 文档：不得虚构，信息不足标记待补充",
+            "- 若提供 已解析指代，文档追加内容必须使用其中 content，不得写成「这句话」或「待补充」",
+            "- 若提供 已解析文档操作，参数已完整；必须立即调用对应 documents 工具，"
+            "原样使用字段，禁止询问或改写",
             "- 文档格式：日期标题必须包含具体时间，格式为 `## YYYY-MM-DD HH:MM`",
             "",
         ]
@@ -118,6 +125,20 @@ class AgentContextBuilder:
             parts.append("")
             parts.append("可用工具：")
             parts.append(_format_tool_schemas_compact(tool_schemas))
+            attachment_names = {
+                str(schema.get("name") or "")
+                for schema in tool_schemas
+                if str(schema.get("name") or "").startswith("attachments.")
+            }
+            if attachment_names:
+                parts.extend(
+                    (
+                        "",
+                        "附件规则：",
+                        "- 仅能使用当前输入“本次检索上下文”中明确给出的 attachment_id",
+                        "- 禁止传 attachments、路径、URL 或猜测 attachment_id",
+                    )
+                )
 
         # 添加输出格式说明（压缩版）
         parts.append("")
@@ -128,9 +149,10 @@ class AgentContextBuilder:
         parts.append(
             '询问：{"type":"ask_user","content":"问题","tool_name":"","arguments":{},"decision_summary":"摘要"}'
         )
-        parts.append(
-            '工具：{"type":"tool_call","content":"","tool_name":"工具名","arguments":{参数},"decision_summary":"摘要"}'
-        )
+        if include_tools and tool_schemas:
+            parts.append(
+                '工具：{"type":"tool_call","content":"","tool_name":"工具名","arguments":{参数},"decision_summary":"摘要"}'
+            )
 
         return "\n".join(parts)
 
@@ -174,6 +196,19 @@ class AgentContextBuilder:
         retrieved = context.metadata.get("retrieved_context")
         if retrieved:
             parts.append(f"本次检索上下文：{retrieved}")
+            if _contains_attachment_id(retrieved):
+                parts.append(
+                    "附件已在进入 Agent 前完成解析。直接使用上述结果；"
+                    "禁止再次调用图片、语音或文档解析工具。"
+                )
+
+        reference = context.metadata.get("reference_context")
+        if reference:
+            parts.append(f"已解析指代：{reference}")
+
+        document_context = context.metadata.get("document_context")
+        if document_context:
+            parts.append(f"已解析文档操作：{document_context}")
 
         # 添加对话键
         if context.conversation_key:
@@ -266,8 +301,8 @@ class AgentContextBuilder:
             role = msg.get("role", "unknown")
             content = msg.get("content", "")
             # 裁剪每条消息
-            if len(content) > 200:
-                content = content[:200] + "..."
+            if len(content) > self.config.max_history_message_chars:
+                content = content[: self.config.max_history_message_chars] + "..."
             parts.append(f"**{role}**: {content}")
 
         return "\n\n".join(parts)
@@ -337,6 +372,17 @@ class AgentContextBuilder:
             return f"返回 {len(output)} 个项目"
 
         return "完成"
+
+
+def _contains_attachment_id(value: object) -> bool:
+    if isinstance(value, dict):
+        attachment_id = value.get("attachment_id")
+        if isinstance(attachment_id, str) and attachment_id.startswith("att_"):
+            return True
+        return any(_contains_attachment_id(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_attachment_id(item) for item in value)
+    return False
 
 
 def _format_tool_schemas_compact(schemas: list[dict]) -> str:

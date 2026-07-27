@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from datetime import datetime, timedelta
@@ -91,12 +92,29 @@ class IntentExtractor:
                 intent="conversation.general",
                 confidence=1.0,
             )
+        if _is_document_request(request.text):
+            return ExtractedIntent(
+                intent="conversation.general",
+                confidence=1.0,
+            )
         context = (
             f"当前时间：{current_time_context(self.timezone)}\n"
             f"默认时区：{self.timezone}\n"
             f"用户请求：{request.text}"
         )
-        if business_context:
+        attachment_retrieved = request.context.get(
+            "retrieved_context",
+            request.context.get("retrieved"),
+        )
+        if attachment_retrieved:
+            serialized = json.dumps(
+                attachment_retrieved,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            context += f"\n本次附件解析结果：{serialized[:6000]}"
+        is_audio_request = "audio" in request.context.get("attachment_kinds", [])
+        if business_context and not is_audio_request:
             recent = "\n".join(
                 f"{message.role}: {message.content}"
                 for message in business_context.recent_messages[-8:]
@@ -122,7 +140,7 @@ class IntentExtractor:
                 SYSTEM_PROMPT,
                 context,
                 run_id=request.message_id or "intent",
-                max_tokens=900,
+                max_tokens=1800,
             )
             return _normalize_creation_missing_fields(extracted)
         except (LLMInvalidResponseError, ValidationError) as error:
@@ -138,7 +156,7 @@ class IntentExtractor:
                     repair,
                     run_id=request.message_id or "intent",
                     step_index=1,
-                    max_tokens=900,
+                    max_tokens=1800,
                 )
                 return _normalize_creation_missing_fields(extracted)
             except (LLMInvalidResponseError, ValidationError) as repair_error:
@@ -160,6 +178,25 @@ def _is_planning_request(text: str) -> bool:
     return any(marker in normalized for marker in _PLANNING_MARKERS) and not any(
         marker in normalized for marker in _EXPLICIT_WRITE_MARKERS
     )
+
+
+def _is_document_request(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", text)
+    has_document = "文档" in normalized or "云文档" in normalized
+    has_action = any(
+        marker in normalized
+        for marker in (
+            "写入",
+            "追加",
+            "添加",
+            "记录到",
+            "记到",
+            "创建",
+            "新建",
+            "生成",
+        )
+    )
+    return has_document and has_action
 
 
 def _normalize_creation_missing_fields(
@@ -188,8 +225,17 @@ def _normalize_creation_missing_fields(
                     missing_fields.append(f"items[{index}].summary")
                 if not isinstance(item, dict) or not item.get("start_time"):
                     missing_fields.append(f"items[{index}].start_time")
-    else:
+    elif extracted.intent in {
+        "calendar.update",
+        "calendar.delete",
+        "task.update",
+        "task.complete",
+        "task.delete",
+        "reminder.cancel",
+    }:
         return extracted
+    else:
+        return extracted.model_copy(update={"missing_fields": []})
     return extracted.model_copy(update={"missing_fields": missing_fields})
 
 

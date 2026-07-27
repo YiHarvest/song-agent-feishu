@@ -342,10 +342,31 @@ class StructuredLlm:
                     {"role": "user", "content": user},
                 ],
             }
-            
-            # 使用 JSON 输出格式
-            # 大多数 OpenAI 兼容 API（SiliconFlow、DeepSeek、GLM 等）都支持此参数
-            request_params["response_format"] = {"type": "json_object"}
+
+            # 根据配置选择结构化输出模式
+            # - json_schema: OpenAI Structured Outputs，严格保证 Schema
+            # - json_object: 宽松模式，只保证是有效 JSON
+            # - none: 禁用，完全依赖提示词
+            structured_mode = getattr(self.settings, "llm_structured_output_mode", "json_object")
+
+            if structured_mode == "json_schema":
+                # OpenAI Structured Outputs: 强制输出符合 schema 的 JSON
+                # 比 json_object 更可靠，能保证字段类型和结构
+                schema_dict = schema.model_json_schema()
+                json_schema = {
+                    "name": schema.__name__,
+                    "strict": True,
+                    "schema": schema_dict,
+                }
+                request_params["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": json_schema,
+                }
+            elif structured_mode == "json_object":
+                # 宽松模式：只保证输出是有效 JSON
+                # 大多数 OpenAI 兼容 API（SiliconFlow、DeepSeek、GLM 等）都支持
+                request_params["response_format"] = {"type": "json_object"}
+            # none: 不设置 response_format，完全依赖提示词
 
             # 调用 OpenAI API
             self.logger.debug(
@@ -384,7 +405,7 @@ class StructuredLlm:
             if not raw or not raw.strip():
                 raise LLMInvalidResponseError("模型返回了空内容")
 
-            # response_format=json_object 保证 JSON 语法；Pydantic 只校验业务结构。
+            # 结构化输出模式保证 JSON 语法；Pydantic 校验业务结构
             try:
                 result = schema.model_validate(json.loads(raw))
             except (json.JSONDecodeError, ValueError) as e:

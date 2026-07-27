@@ -44,13 +44,23 @@ Song Agent 是基于 Python 与 FastAPI 实现的多用户飞书智能助手。�
 
 建议权限至少包括：
 
-- 应用身份：`im:message:send_as_bot`、`im:message.group_at_msg:readonly`、`im:message.p2p_msg:readonly`
+- 应用身份：`im:message:send_as_bot`、`im:message.p2p_msg:readonly`、
+  `im:message.group_msg`
 - 用户身份：`calendar:calendar`、`calendar:calendar:readonly`、
   `calendar:calendar.event:create`、`calendar:calendar.event:read`、
   `task:task:read`、`task:task:write`、`docx:document`、`drive:drive`、
   `search:docs:read`、`offline_access`
 - 长连接事件：`im.message.receive_v1`
 - 卡片回调：`card.action.trigger`
+
+机器人加入任意群后，群内任何成员首次 `@机器人` 即自动登记该群并获得回复；
+无需管理员预先绑定。开通敏感权限 `im:message.group_msg` 后，群内普通文字、
+图片、语音和文件无需 `@机器人` 也会推送给服务并获得回复。
+
+`im:message.group_msg` 必须在飞书开放平台的权限管理中以应用身份开通，然后创建并
+发布新版本，等待企业管理员审批。只开通
+`im:message.group_at_msg:readonly` 时，飞书不会向服务推送未 `@` 的文字或纯图片；
+代码无法补回平台未投递的事件。
 
 公网回调：
 

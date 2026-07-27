@@ -176,7 +176,10 @@ def format_plan(record: DailyRecord) -> str:
             lines.append(f"- **{task.id}** {task.title}｜{timing}")
         lines.append("")
     if record.plan_status == "draft" and any(task.start_time for task in record.tasks):
-        lines.append("请点击确认卡片后，我才会写入你自己的飞书日历。")
+        lines.append(
+            "请在确认卡片中选择是否写入你自己的飞书日历；"
+            "确认后默认提前 10 分钟提醒。"
+        )
     return "\n".join(lines)
 
 

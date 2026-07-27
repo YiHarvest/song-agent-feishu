@@ -1,10 +1,12 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from song_agent.domain.results import ExecutionContext
 from song_agent.executors.calendar_executor import CalendarCreateExecutor
+from song_agent.executors.registry import ExecutorRegistry
 from song_agent.feishu.openapi import FeishuApiError
 from song_agent.models import IncomingMessage, UserTokenContext
 from song_agent.services.encryption import AesGcmTokenCipher
@@ -58,6 +60,60 @@ class Transport:
     async def send_markdown(self, *args, **kwargs):
         self.messages.append((args, kwargs))
         return "message"
+
+
+@pytest.mark.asyncio
+async def test_registry_routes_plan_calendar_payload_to_legacy_handler() -> None:
+    legacy_actions = []
+    direct_actions = []
+
+    async def legacy_handler(action):
+        legacy_actions.append(action)
+
+    class DirectExecutor:
+        action_type = "calendar.create"
+
+        async def execute(self, action, context):
+            direct_actions.append((action, context))
+
+    registry = ExecutorRegistry(legacy_handler=legacy_handler)
+    registry.register(DirectExecutor())
+    plan_action = SimpleNamespace(
+        action_type="calendar.create",
+        payload={"record_key": "plan-record"},
+    )
+
+    await registry.execute(plan_action)
+
+    assert legacy_actions == [plan_action]
+    assert direct_actions == []
+
+
+@pytest.mark.asyncio
+async def test_registry_keeps_direct_calendar_payload_on_executor() -> None:
+    legacy_actions = []
+    direct_actions = []
+
+    async def legacy_handler(action):
+        legacy_actions.append(action)
+
+    class DirectExecutor:
+        action_type = "calendar.create"
+
+        async def execute(self, action, context):
+            direct_actions.append((action, context))
+
+    registry = ExecutorRegistry(legacy_handler=legacy_handler)
+    registry.register(DirectExecutor())
+    direct_action = SimpleNamespace(
+        action_type="calendar.create",
+        payload={"summary": "开会"},
+    )
+
+    await registry.execute(direct_action)
+
+    assert legacy_actions == []
+    assert direct_actions[0][0] is direct_action
 
 
 async def setup_action(tmp_path: Path):

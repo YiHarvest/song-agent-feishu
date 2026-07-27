@@ -34,6 +34,13 @@ class ExecutorRegistry:
         self.executors[executor.action_type] = executor
 
     async def execute(self, action: PendingAction) -> None:
+        if (
+            self.legacy_handler
+            and action.action_type == "calendar.create"
+            and isinstance(action.payload.get("record_key"), str)
+        ):
+            await self.legacy_handler(action)
+            return
         executor = self.executors.get(action.action_type)
         if executor:
             await executor.execute(

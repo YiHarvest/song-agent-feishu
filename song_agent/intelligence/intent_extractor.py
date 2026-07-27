@@ -20,6 +20,7 @@ SYSTEM_PROMPT = """你是 Song Agent 的意图提取器。
 calendar.create/reminder.create 的 arguments 使用 CalendarCreateCommand 字段：
 summary、start_time、end_time、timezone、description、location、
 reminder_minutes、attendee_open_ids、is_all_day、recurrence。
+calendar.create 只要求 summary 和 start_time；end_time 可省略，系统默认持续 60 分钟。
 reminder_minutes 必须是整数 JSON 数组，例如立即提醒写 [0]，提前十分钟写 [10]。
 reminder.create 只提取触发时间为 start_time，不要输出 end_time。
 calendar.query 使用 query、start_time、end_time、event_id、page_size。
@@ -33,12 +34,42 @@ task.update 使用 task_guid、fields；task.complete/task.delete 使用 task_gu
 reminder.query 使用日历查询字段；reminder.cancel 使用 event_id。
 一次请求包含多个提醒时使用 reminder.batch_create，arguments 格式为
 {"items":[CalendarCreateCommand对象,...]}。
+reminder.batch_create 每项只要求 summary 和 start_time；不要把 end_time 写入 missing_fields。
 时间必须输出带时区 ISO 8601。相对时间按提供的当前时间计算。
 缺少创建所需字段时写入 missing_fields，禁止猜测。
 普通对话和开放分析使用 conversation.general/content.summarize/content.analyze。
-文档创建、文档追加、计划处理、联网搜索统一使用 conversation.general；
+文档创建、文档追加、计划处理、联网搜索统一使用 conversation.general。
+用户说“规划”“制定计划”时，即使列出具体时间，也属于计划处理；
+仅当用户明确要求创建日程、加入日历、设置提醒或创建任务时才选择写操作意图。
 禁止输出 document.create、document.append 等未定义意图。
 输出 ExtractedIntent JSON 对象。"""
+
+_PLANNING_MARKERS = (
+    "规划",
+    "制定计划",
+    "安排计划",
+    "计划一下",
+    "帮我计划",
+    "给我计划",
+)
+_EXPLICIT_WRITE_MARKERS = (
+    "创建日程",
+    "新建日程",
+    "添加日程",
+    "加入日历",
+    "加到日历",
+    "写入日历",
+    "记到日历",
+    "放到日历",
+    "提醒我",
+    "设置提醒",
+    "设个提醒",
+    "定个提醒",
+    "闹钟",
+    "创建任务",
+    "新建任务",
+    "添加任务",
+)
 
 
 class IntentExtractor:
@@ -55,6 +86,11 @@ class IntentExtractor:
         batch = _extract_numbered_reminders(request.text, self.timezone)
         if batch is not None:
             return batch
+        if _is_planning_request(request.text):
+            return ExtractedIntent(
+                intent="conversation.general",
+                confidence=1.0,
+            )
         context = (
             f"当前时间：{current_time_context(self.timezone)}\n"
             f"默认时区：{self.timezone}\n"
@@ -81,13 +117,14 @@ class IntentExtractor:
                 f"\n当前待处理业务对象：{business_context.active_pending_action or {}}"
             )
         try:
-            return await self.llm.generate(
+            extracted = await self.llm.generate(
                 ExtractedIntent,
                 SYSTEM_PROMPT,
                 context,
                 run_id=request.message_id or "intent",
                 max_tokens=900,
             )
+            return _normalize_creation_missing_fields(extracted)
         except (LLMInvalidResponseError, ValidationError) as error:
             repair = (
                 f"{context}\n"
@@ -95,7 +132,7 @@ class IntentExtractor:
                 "修复字段语义，重新输出一个 JSON 对象。"
             )
             try:
-                return await self.llm.generate(
+                extracted = await self.llm.generate(
                     ExtractedIntent,
                     SYSTEM_PROMPT,
                     repair,
@@ -103,6 +140,7 @@ class IntentExtractor:
                     step_index=1,
                     max_tokens=900,
                 )
+                return _normalize_creation_missing_fields(extracted)
             except (LLMInvalidResponseError, ValidationError) as repair_error:
                 self.logger.warning(
                     "意图提取连续返回无效结构，降级到通用 Agent "
@@ -115,6 +153,48 @@ class IntentExtractor:
                     intent="conversation.general",
                     confidence=1.0,
                 )
+
+
+def _is_planning_request(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", text)
+    return any(marker in normalized for marker in _PLANNING_MARKERS) and not any(
+        marker in normalized for marker in _EXPLICIT_WRITE_MARKERS
+    )
+
+
+def _normalize_creation_missing_fields(
+    extracted: ExtractedIntent,
+) -> ExtractedIntent:
+    arguments = extracted.arguments
+    missing_fields: list[str]
+    if extracted.intent in {"calendar.create", "reminder.create"}:
+        missing_fields = []
+        if not _nonempty_text(arguments.get("summary")):
+            missing_fields.append("summary")
+        if not arguments.get("start_time"):
+            missing_fields.append("start_time")
+    elif extracted.intent == "task.create":
+        missing_fields = (
+            [] if _nonempty_text(arguments.get("summary")) else ["summary"]
+        )
+    elif extracted.intent == "reminder.batch_create":
+        items = arguments.get("items")
+        if not isinstance(items, list) or len(items) < 2:
+            missing_fields = ["items"]
+        else:
+            missing_fields = []
+            for index, item in enumerate(items):
+                if not isinstance(item, dict) or not _nonempty_text(item.get("summary")):
+                    missing_fields.append(f"items[{index}].summary")
+                if not isinstance(item, dict) or not item.get("start_time"):
+                    missing_fields.append(f"items[{index}].start_time")
+    else:
+        return extracted
+    return extracted.model_copy(update={"missing_fields": missing_fields})
+
+
+def _nonempty_text(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
 
 
 def _extract_numbered_reminders(

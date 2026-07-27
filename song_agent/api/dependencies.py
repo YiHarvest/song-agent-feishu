@@ -1,4 +1,4 @@
-"""React/API 身份依赖。"""
+"""HTTP API 身份依赖。"""
 
 import uuid
 from typing import Annotated

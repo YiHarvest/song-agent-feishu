@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ..config import Settings
+from ..llm import LLMOutputTruncatedError
 from ..policies.tool_policy import ToolPolicyGuard
 from .budget import AgentRunBudget, BudgetExceededError
 from .context import AgentContext
@@ -299,16 +300,39 @@ class ReActRuntime:
             )
             user_message += f"\n\n{observation_summary}"
 
-        # 调用 LLM
-        decision = await self.llm.generate(
-            AgentDecision,
-            system_prompt,
-            user_message,
-            run_id=context.run_id,
-            step_index=step_index,
-            max_tokens=self.settings.llm_decision_max_tokens,
-            tool_schema_count=len(tool_schemas),
-        )
+        # AgentDecision 也承载最终正文。使用最终回答上限；工具调用仍会自然提前结束，
+        # 不会因为上限变大而额外消耗输出 token。
+        try:
+            decision = await self.llm.generate(
+                AgentDecision,
+                system_prompt,
+                user_message,
+                run_id=context.run_id,
+                step_index=step_index,
+                max_tokens=self.settings.llm_final_max_tokens,
+                tool_schema_count=len(tool_schemas),
+            )
+        except LLMOutputTruncatedError:
+            # 首次截断计入预算，再要求模型压缩为完整回答。第二次仍截断则向上抛出，
+            # 绝不把半句内容标记为 completed。
+            budget.record_llm_request()
+            budget.ensure_can_call_llm(
+                reserve_seconds=self.settings.agent_finish_reserve_seconds
+            )
+            compact_system_prompt = (
+                system_prompt
+                + "\n\n上次输出达到长度上限。必须给出完整 JSON 和完整回答；"
+                "减少条目数量，压缩每条说明，禁止半句结束。"
+            )
+            decision = await self.llm.generate(
+                AgentDecision,
+                compact_system_prompt,
+                user_message,
+                run_id=context.run_id,
+                step_index=step_index,
+                max_tokens=self.settings.llm_final_max_tokens,
+                tool_schema_count=len(tool_schemas),
+            )
 
         return _normalize_tool_decision(
             context,

@@ -7,7 +7,7 @@ import pytest
 from song_agent.agent.runtime import ReActRuntime
 from song_agent.config import Settings
 from song_agent.search.mcp import SearchMcp, SearchResult
-from song_agent.workflow import AgentWorkflow
+from song_agent.workflow import AgentWorkflow, _format_stored_tool_result
 
 
 @pytest.mark.asyncio
@@ -96,3 +96,28 @@ async def test_search_result_returns_to_agent_as_observation() -> None:
     assert result.terminal is False
     assert "Agent Harnesses" in result.summary
     assert "https://learn.microsoft.com/example" in result.summary
+
+
+def test_stored_search_result_compacts_at_source_boundaries() -> None:
+    formatted = _format_stored_tool_result(
+        {
+            "summary": "找到 4 条结果",
+            "payload": {
+                "items": [
+                    {
+                        "title": f"新闻 {index}",
+                        "source": f"来源 {index}",
+                        "snippet": "完整句子。" * 80,
+                        "url": f"https://example.com/{index}",
+                    }
+                    for index in range(4)
+                ]
+            },
+        },
+        max_length=700,
+    )
+
+    assert len(formatted) <= 700
+    assert "[来源 0] 新闻 0" in formatted
+    assert "其余" in formatted
+    assert not formatted.endswith("完整句")

@@ -1,6 +1,6 @@
 # Song Agent：确定性业务执行 + 开放式 Agent
 
-Song Agent 是 Python、FastAPI 与 React 实现的多用户飞书工作台。自然语言先经过一次结构化意图提取；日历等确定性业务进入应用服务、PendingAction、Outbox 和 Executor，开放式对话才进入有限步数 ReAct Runtime。
+Song Agent 是基于 Python 与 FastAPI 实现的多用户飞书智能助手。自然语言先经过一次结构化意图提取；日历等确定性业务进入应用服务、PendingAction、Outbox 和 Executor，开放式对话才进入有限步数 ReAct Runtime。
 
 ## 核心功能
 
@@ -18,7 +18,7 @@ Song Agent 是 Python、FastAPI 与 React 实现的多用户飞书工作台。�
 - OAuth access/refresh token 使用 AES-256-GCM 加密后存入 SQLite，数据库启用 WAL。
 - `UserTokenContext` 只含短生命周期 access token，不含 refresh token。
 - LLM 只提取意图和业务字段，不能决定授权、确认、执行器或卡片结构。
-- 日历写操作先创建持久化 PendingAction，再由创建者在飞书或 React 确认。
+- 日历写操作先创建持久化 PendingAction，再由创建者在飞书确认。
 - 飞书交互卡片只使用 `schema: "2.0"`；卡片只携带动作名和 `action_id`，完整业务参数以数据库为准。
 - 确认与 Outbox 同事务，执行前原子 claim，并记录 action attempt。
 - Outbox 由独立消费者恢复；远端结果不确定时进入 UNKNOWN，不会盲目重试。
@@ -65,22 +65,6 @@ https://你的域名/feishu/card/action
 uv sync
 cp .env.example .env
 uv run song-agent --reload
-```
-
-React 开发服务：
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-生产构建：
-
-```bash
-cd frontend
-npm ci
-npm run build
 ```
 
 开发环境可使用 ngrok：
@@ -139,7 +123,6 @@ uv run song-agent-rotate-keys
 uv run ruff check song_agent tests
 uv run pytest -q
 curl http://127.0.0.1:45837/health
-cd frontend && npm test -- --run && npm run build
 ```
 
 数据保存在 `.data/song-agent.db`，权限为 `0600`。旧 `.data/state.json` 仅在首次迁移时读取，迁移后不会继续写入。

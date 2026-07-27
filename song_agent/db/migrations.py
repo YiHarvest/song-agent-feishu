@@ -35,6 +35,8 @@ async def run_migrations(
         ("0008_oauth_original_request", _oauth_original_request),
         ("0009_business_pending_actions", _business_pending_actions),
         ("0010_context_memory", _context_memory),
+        ("0011_attachments", _attachments),
+        ("0012_agent_api", _agent_api),
     )
     for migration_id, migration in migrations:
         cursor = await db.execute(
@@ -54,6 +56,108 @@ async def run_migrations(
         except Exception:
             await db.rollback()
             raise
+
+
+async def _attachments(
+    db: aiosqlite.Connection,
+    cipher: AesGcmTokenCipher,
+) -> None:
+    del cipher
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS attachments (
+            attachment_id TEXT PRIMARY KEY,
+            tenant_key TEXT NOT NULL,
+            app_id TEXT NOT NULL,
+            principal_id TEXT NOT NULL,
+            source TEXT NOT NULL,
+            source_message_id TEXT NOT NULL,
+            source_resource_key TEXT NOT NULL DEFAULT '',
+            attachment_kind TEXT NOT NULL CHECK (
+                attachment_kind IN ('image', 'audio', 'document', 'unknown')
+            ),
+            filename TEXT NOT NULL,
+            media_type TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            sha256 TEXT NOT NULL,
+            storage_path TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (
+                status IN ('downloading', 'ready', 'parsing', 'parsed', 'failed', 'expired')
+            ),
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            expires_at INTEGER
+        )
+        """
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_attachments_owner "
+        "ON attachments(tenant_key, app_id, principal_id, created_at)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(tenant_key, source_message_id)"
+    )
+
+
+async def _agent_api(
+    db: aiosqlite.Connection,
+    cipher: AesGcmTokenCipher,
+) -> None:
+    del cipher
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS api_idempotency (
+            tenant_key TEXT NOT NULL,
+            principal_id TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            request_hash TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('processing', 'completed')),
+            response_json TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            PRIMARY KEY (tenant_key, principal_id, idempotency_key)
+        )
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS api_binding_codes (
+            code_hash TEXT PRIMARY KEY,
+            tenant_key TEXT NOT NULL,
+            app_id TEXT NOT NULL,
+            principal_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            consumed_at INTEGER
+        )
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS api_channel_bindings (
+            binding_id TEXT PRIMARY KEY,
+            tenant_key TEXT NOT NULL,
+            app_id TEXT NOT NULL,
+            principal_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            external_tenant_key TEXT NOT NULL,
+            external_app_id TEXT NOT NULL,
+            external_subject_id TEXT NOT NULL,
+            external_open_id TEXT NOT NULL,
+            external_user_id TEXT NOT NULL DEFAULT '',
+            external_union_id TEXT NOT NULL DEFAULT '',
+            external_chat_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+        """
+    )
+    await db.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_api_bindings_owner
+        ON api_channel_bindings(tenant_key, app_id, principal_id, created_at)
+        """
+    )
 
 
 async def rotate_oauth_tokens(

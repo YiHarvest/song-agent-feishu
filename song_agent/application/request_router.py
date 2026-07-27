@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from ..context.builders import AgentRuntimeContextBuilder, BusinessContextBuilder
 from ..context.service import ConversationContextService
 from ..domain.commands import DirectPendingActionCommand
@@ -121,9 +123,25 @@ class RequestRouter:
                 message=f"{extracted.intent} 已进入确定性路由，但该业务服务尚未启用。",
             )
         else:
+            agent_metadata = self.agent_contexts.metadata(business_context)
+            reference_context = _resolve_reference_context(request, business_context)
+            if reference_context:
+                agent_metadata["reference_context"] = reference_context
+            document_context = _resolve_document_context(request, reference_context)
+            if document_context:
+                agent_metadata["document_context"] = document_context
+            attachment_retrieved = request.context.get(
+                "retrieved_context",
+                request.context.get("retrieved"),
+            )
+            if attachment_retrieved:
+                agent_metadata["retrieved_context"] = attachment_retrieved
             enriched = request.model_copy(
                 update={
-                    "context": self.agent_contexts.metadata(business_context),
+                    "context": {
+                        **request.context,
+                        **agent_metadata,
+                    },
                 }
             )
             result = await self.general_agent.run(enriched)
@@ -140,3 +158,73 @@ class RequestRouter:
         if command.action == "pending_action.cancel":
             return await self.pending_actions.cancel(request.identity, command.action_id)
         return await self.pending_actions.retry(request.identity, command.action_id)
+
+
+def _resolve_reference_context(
+    request: UserRequest,
+    business_context: object,
+) -> dict[str, str] | None:
+    if not any(
+        marker in request.text
+        for marker in ("这句话", "这段话", "上句话", "上一句话", "刚才那句话")
+    ):
+        return None
+    messages = getattr(business_context, "recent_messages", ())
+    for message in reversed(messages):
+        content = str(getattr(message, "content", "") or "").strip()
+        role = str(getattr(message, "role", "") or "")
+        if not content or content == request.text.strip():
+            continue
+        if content.startswith(
+            ("还需要：", "处理失败", "请求意图不够明确", "处理完成。")
+        ):
+            continue
+        if _is_reference_command(content):
+            continue
+        return {"role": role, "content": content[:4000]}
+    return None
+
+
+def _is_reference_command(content: str) -> bool:
+    return any(marker in content for marker in ("这句话", "这段话", "上句话")) and any(
+        marker in content for marker in ("写入", "追加", "记录到", "记到")
+    )
+
+
+def _resolve_document_context(
+    request: UserRequest,
+    reference_context: dict[str, str] | None,
+) -> dict[str, str | None] | None:
+    normalized = re.sub(r"\s+", "", request.text)
+    if not ("文档" in normalized and any(
+        marker in normalized for marker in ("写入", "追加", "添加", "记录到", "记到")
+    )):
+        return None
+    title_match = re.search(
+        r"(?:中的|里的)([^，。]{1,100}?)(?:云文档|文档)",
+        normalized,
+    )
+    if title_match is None:
+        title_match = re.search(
+            r"(?:文档叫做|文档名为|名为|叫做)([^，。]{1,100})$",
+            normalized,
+        )
+    target_title = title_match.group(1).strip() if title_match else ""
+    explicit_match = re.search(
+        r"把(.+?)(?:这句话|这段话)?(?:写入|追加|添加到|记录到|记到)",
+        normalized,
+    )
+    explicit = explicit_match.group(1).strip() if explicit_match else ""
+    if explicit in {"这句话", "这段话", "上句话", "上一句话"}:
+        explicit = ""
+    markdown = explicit or (
+        reference_context.get("content", "") if reference_context else ""
+    )
+    if not target_title or not markdown:
+        return None
+    return {
+        "action": "append",
+        "title": None,
+        "target_title": target_title,
+        "markdown": markdown,
+    }

@@ -124,6 +124,13 @@ class Settings(BaseSettings):
     # LLM 重试配置
     llm_max_retries: int = Field(default=1, ge=0, le=2)
 
+    # LLM 结构化输出模式
+    # - "json_schema": OpenAI Structured Outputs，严格保证输出符合 Schema
+    # - "json_object": 宽松模式，只保证输出是有效 JSON
+    # - "none": 禁用结构化输出，完全依赖提示词
+    # 注意：只有 OpenAI 和部分兼容 API（如 SiliconFlow）支持 json_schema
+    llm_structured_output_mode: str = Field(default="json_object")
+
     # LLM 输出 Token 限制（按阶段）
     llm_decision_max_tokens: int = Field(default=1200, ge=200, le=2000)
     llm_final_max_tokens: int = Field(default=4096, ge=500, le=8000)

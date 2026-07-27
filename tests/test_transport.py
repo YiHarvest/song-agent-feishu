@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -78,3 +79,148 @@ async def test_transport_close_drains_inflight_message_tasks() -> None:
     release.set()
     await closing
     assert not instance._futures
+
+
+@pytest.mark.asyncio
+async def test_new_group_is_auto_registered_for_any_sender() -> None:
+    class Store:
+        def __init__(self) -> None:
+            self.added: list[tuple[str, str, str]] = []
+
+        async def add_group_chat_id(self, chat_id, *, tenant_key, app_id) -> None:
+            self.added.append((chat_id, tenant_key, app_id))
+
+    instance = object.__new__(transport.FeishuTransport)
+    instance.settings = SimpleNamespace(feishu_app_id="app")
+    instance.store = Store()
+    instance.logger = logging.getLogger("test.transport.group")
+    instance.group_ids = {"oc_hermes"}
+    received = []
+
+    async def handler(message) -> None:
+        received.append(message)
+
+    event = SimpleNamespace(
+        header=SimpleNamespace(tenant_key="tenant", event_id="event-new-group"),
+        event=SimpleNamespace(
+            sender=SimpleNamespace(
+                sender_id=SimpleNamespace(
+                    open_id="ou_regular_member",
+                    user_id="user",
+                    union_id="union",
+                )
+            ),
+            message=SimpleNamespace(
+                message_id="om_new_group",
+                chat_id="oc_song_agent",
+                chat_type="group",
+                message_type="text",
+                content='{"text":"@_user_1 你好"}',
+                thread_id="",
+                root_id="",
+            ),
+        ),
+    )
+
+    await instance._dispatch(event, handler)
+
+    assert instance.group_ids == {"oc_hermes", "oc_song_agent"}
+    assert instance.store.added == [("oc_song_agent", "tenant", "app")]
+    assert len(received) == 1
+    assert received[0].open_id == "ou_regular_member"
+    assert received[0].chat_id == "oc_song_agent"
+
+
+@pytest.mark.asyncio
+async def test_registered_group_accepts_messages_from_different_members() -> None:
+    class Store:
+        async def add_group_chat_id(self, *args, **kwargs) -> None:
+            raise AssertionError("registered group must not be inserted again")
+
+    instance = object.__new__(transport.FeishuTransport)
+    instance.settings = SimpleNamespace(feishu_app_id="app")
+    instance.store = Store()
+    instance.logger = logging.getLogger("test.transport.group")
+    instance.group_ids = {"oc_song_agent"}
+    received = []
+
+    async def handler(message) -> None:
+        received.append(message)
+
+    def event(open_id: str, message_id: str):
+        return SimpleNamespace(
+            header=SimpleNamespace(tenant_key="tenant", event_id=f"event-{message_id}"),
+            event=SimpleNamespace(
+                sender=SimpleNamespace(
+                    sender_id=SimpleNamespace(
+                        open_id=open_id,
+                        user_id="",
+                        union_id="",
+                    )
+                ),
+                message=SimpleNamespace(
+                    message_id=message_id,
+                    chat_id="oc_song_agent",
+                    chat_type="group",
+                    message_type="text",
+                    content='{"text":"@_user_1 你好"}',
+                    thread_id="",
+                    root_id="",
+                ),
+            ),
+        )
+
+    await instance._dispatch(event("ou_member_1", "om_1"), handler)
+    await instance._dispatch(event("ou_member_2", "om_2"), handler)
+
+    assert [message.open_id for message in received] == [
+        "ou_member_1",
+        "ou_member_2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unmentioned_group_image_event_reaches_attachment_handler() -> None:
+    class Store:
+        async def add_group_chat_id(self, *args, **kwargs) -> None:
+            raise AssertionError("registered group must not be inserted again")
+
+    instance = object.__new__(transport.FeishuTransport)
+    instance.settings = SimpleNamespace(feishu_app_id="app")
+    instance.store = Store()
+    instance.logger = logging.getLogger("test.transport.group.image")
+    instance.group_ids = {"oc_song_agent"}
+    received = []
+
+    async def handler(message) -> None:
+        received.append(message)
+
+    event = SimpleNamespace(
+        header=SimpleNamespace(tenant_key="tenant", event_id="event-image"),
+        event=SimpleNamespace(
+            sender=SimpleNamespace(
+                sender_id=SimpleNamespace(
+                    open_id="ou_member",
+                    user_id="",
+                    union_id="",
+                )
+            ),
+            message=SimpleNamespace(
+                message_id="om_image",
+                chat_id="oc_song_agent",
+                chat_type="group",
+                message_type="image",
+                content='{"image_key":"img_group_without_mention"}',
+                thread_id="",
+                root_id="",
+            ),
+        ),
+    )
+
+    await instance._dispatch(event, handler)
+
+    assert len(received) == 1
+    assert received[0].text == ""
+    assert len(received[0].attachments) == 1
+    assert received[0].attachments[0].kind == "image"
+    assert received[0].attachments[0].resource_key == "img_group_without_mention"

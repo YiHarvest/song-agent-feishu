@@ -173,18 +173,19 @@ class FeishuTransport:
                 return
             if message.chat_type == "group":
                 if message.chat_id not in self.group_ids:
-                    if self.group_ids or (
-                        self.settings.admin_user_ids and open_id not in self.settings.admin_user_ids
-                    ):
-                        self.logger.warning("忽略未绑定群聊消息", extra={"chat_id": message.chat_id})
-                        return
+                    # 飞书只会把机器人有权接收的群消息推送到这里。
+                    # 机器人被拉入新群并收到首次 @ 消息后自动登记；不再限制首次发送者。
                     self.group_ids.add(message.chat_id)
                     await self.store.add_group_chat_id(
                         message.chat_id,
                         tenant_key=tenant_key,
                         app_id=self.settings.feishu_app_id,
                     )
-                    self.logger.info("已由管理员首次艾特绑定群聊 %s", message.chat_id)
+                    self.logger.info(
+                        "已自动登记群聊 chat_id=%s first_sender=%s",
+                        message.chat_id,
+                        open_id,
+                    )
             else:
                 await self.store.save_p2p_chat_id(
                     subject_id,

@@ -1,4 +1,5 @@
 from datetime import datetime
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -17,8 +18,10 @@ class Llm:
     def __init__(self, outputs):
         self.outputs = list(outputs)
         self.calls = 0
+        self.users = []
 
     async def generate(self, schema, system, user, **kwargs):
+        self.users.append(user)
         output = self.outputs[self.calls]
         self.calls += 1
         if isinstance(output, Exception):
@@ -52,6 +55,36 @@ async def test_intent_extractor_identifies_calendar_and_missing_fields() -> None
 
 
 @pytest.mark.asyncio
+async def test_intent_extractor_receives_attachment_result() -> None:
+    llm = Llm(
+        [
+            {
+                "intent": "conversation.general",
+                "confidence": 1,
+            }
+        ]
+    )
+    image_request = request().model_copy(
+        update={
+            "text": "这个报错怎么解决？",
+            "context": {
+                "retrieved_context": [
+                    {
+                        "source_type": "image",
+                        "analysis": "图片显示数据库连接超时",
+                    }
+                ]
+            },
+        }
+    )
+
+    await IntentExtractor(llm, "Asia/Shanghai").extract(image_request)
+
+    assert "本次附件解析结果" in llm.users[0]
+    assert "数据库连接超时" in llm.users[0]
+
+
+@pytest.mark.asyncio
 async def test_planning_request_routes_to_general_without_llm() -> None:
     llm = Llm([])
     planning_request = request().model_copy(
@@ -65,6 +98,75 @@ async def test_planning_request_routes_to_general_without_llm() -> None:
     assert result.intent == "conversation.general"
     assert result.missing_fields == []
     assert llm.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_document_request_routes_to_general_without_intent_llm() -> None:
+    llm = Llm([])
+    document_request = request().model_copy(
+        update={"text": "把这句话写入到 hermes 群中的每日记录云文档中"}
+    )
+
+    result = await IntentExtractor(llm, "Asia/Shanghai").extract(document_request)
+
+    assert result.intent == "conversation.general"
+    assert result.missing_fields == []
+    assert llm.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_general_intent_discards_model_invented_missing_fields() -> None:
+    llm = Llm(
+        [
+            {
+                "intent": "conversation.general",
+                "missing_fields": [
+                    "text_to_append",
+                    "document_name",
+                    "append_position",
+                ],
+                "confidence": 0.99,
+            }
+        ]
+    )
+
+    result = await IntentExtractor(llm, "Asia/Shanghai").extract(
+        request().model_copy(update={"text": "我现在说话你能听见吗？"})
+    )
+
+    assert result.intent == "conversation.general"
+    assert result.missing_fields == []
+
+
+@pytest.mark.asyncio
+async def test_audio_intent_excludes_old_conversation_from_classifier() -> None:
+    llm = Llm(
+        [
+            {
+                "intent": "conversation.general",
+                "confidence": 0.99,
+            }
+        ]
+    )
+    audio_request = request().model_copy(
+        update={
+            "text": "今天天气怎么样？",
+            "context": {"attachment_kinds": ["audio"]},
+        }
+    )
+    business = SimpleNamespace(
+        recent_messages=[
+            SimpleNamespace(role="user", content="把这句话写入每日记录云文档")
+        ],
+        memories=[],
+        conversation_summary=None,
+        active_pending_action=None,
+    )
+
+    await IntentExtractor(llm, "Asia/Shanghai").extract(audio_request, business)
+
+    assert "最近对话" not in llm.users[0]
+    assert "每日记录云文档" not in llm.users[0]
 
 
 @pytest.mark.asyncio

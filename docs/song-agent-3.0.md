@@ -20,6 +20,7 @@ Song Agent 3.0 是一个企业级智能助手平台，在 2.1 的分层架构基
 | 多模态 | 仅文本 | 图片、语音、文档解析 |
 | 渠道绑定 | 无 | API 用户绑定飞书身份 |
 | 附件工具 | 无 | `attachments.analyze_image`、`attachments.transcribe_audio`、`attachments.parse_document` |
+| 网络搜索 | 单一引擎 | SearXNG、TalorData、You.com、Tavily 多引擎 MCP |
 
 ### 核心特性
 
@@ -27,13 +28,13 @@ Song Agent 3.0 是一个企业级智能助手平台，在 2.1 的分层架构基
 - ✅ **确定性路由**：日历、任务、提醒等业务走结构化意图提取，不进入 ReAct
 - ✅ **ReAct 智能决策**：开放对话和复杂分析使用 LLM 自主选择工具
 - ✅ **OpenAI 兼容 API**：外部系统可通过标准 OpenAI SDK 调用
-- ✅ **多模态处理**：图片理解、语音转写、文档解析
+- ✅ **多模态处理**：图片理解（Kimi K2.6）、语音转写、文档解析（MinerU VL）
 - ✅ **渠道绑定**：API 用户可绑定飞书身份，实现消息推送
 - ✅ **预算管理**：时间预算、请求预算、工具调用预算
 - ✅ **安全隔离**：OAuth 2.0 多用户隔离，Token 加密存储
 - ✅ **人工确认**：敏感操作需要用户确认后执行
 - ✅ **可靠执行**：Pending Action 状态机 + Outbox 模式
-- ✅ **网络搜索**：集成 SearXNG、TalorData、You.com、Tavily 搜索引擎
+- ✅ **网络搜索**：通过 search-engine-tool-mcp 集成多搜索引擎
 
 ---
 
@@ -101,7 +102,7 @@ Song Agent 3.0 是一个企业级智能助手平台，在 2.1 的分层架构基
 │                          Tool Layer                                  │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐ │
 │  │ Feishu API  │  │ Web Search  │  │ Attachments │  │ Documents   │ │
-│  │ (openapi)   │  │ (MCP)       │  │ (tools)     │  │ (parsers)   │ │
+│  │ (openapi)   │  │ (MCP) ★新增 │  │ (tools)     │  │ (parsers)   │ │
 │  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘ │
 └─────────────────────────────────────────────────────────────────────┘
                                   │
@@ -351,7 +352,40 @@ SONG_AGENT_MINERU_VL_READ_TIMEOUT_SECONDS=300
 SONG_AGENT_MINERU_VL_MAX_PAGES=100
 ```
 
-### 3.8 Agent 上下文构建器（增强）
+### 3.9 网络搜索 MCP (`search/mcp.py`)
+
+**职责**：通过 search-engine-tool-mcp 提供多引擎搜索能力
+
+**核心功能**：
+- 多搜索引擎支持：SearXNG、TalorData、You.com、Tavily
+- 自动选择：`provider: auto` 根据配置自动选择可用引擎
+- 搜索深度：支持 `basic` 和 `advanced` 搜索模式
+- 结果聚合：统一 `SearchResult` 数据结构
+
+**配置项**：
+
+```env
+# 搜索引擎 API Keys（至少配置一个）
+SEARXNG_BASE_URL=https://searx.be
+TALORDATA_API_KEY=xxx
+YDC_API_KEY=xxx
+TAVILY_API_KEY=xxx
+```
+
+**工具接口**：
+
+```python
+async def search(
+    query: str,
+    *,
+    provider: str = "auto",       # searxng, you, tavily, auto
+    max_results: int = 5,
+    search_depth: str = "basic",  # basic, advanced
+    include_answer: bool = False,
+) -> list[SearchResult]
+```
+
+### 3.10 Agent 上下文构建器（增强）
 
 **新增功能**：
 
@@ -476,13 +510,15 @@ SONG_AGENT_API_ENABLED=true
 SONG_AGENT_API_MODEL_ID=song-agent-2.1
 SONG_AGENT_API_KEY_NAME=mentor
 SONG_AGENT_API_KEY=sk-song-xxx
+SONG_AGENT_API_DEFAULT_TENANT=default
+SONG_AGENT_API_APP_ID=song-agent-api
 
 # 限流和超时
-SONG_AGENT_API_RATE_LIMIT_PER_MINUTE=30
-SONG_AGENT_API_MAX_MESSAGES=30
-SONG_AGENT_API_MAX_MESSAGE_CHARS=20000
-SONG_AGENT_API_MAX_TOTAL_CHARS=60000
-SONG_AGENT_API_SYNC_TIMEOUT_SECONDS=150
+SONG_AGENT_API_RATE_LIMIT_PER_MINUTE=60
+SONG_AGENT_API_MAX_MESSAGES=100
+SONG_AGENT_API_MAX_MESSAGE_CHARS=50000
+SONG_AGENT_API_MAX_TOTAL_CHARS=200000
+SONG_AGENT_API_SYNC_TIMEOUT_SECONDS=180
 
 # 幂等性和绑定
 SONG_AGENT_API_IDEMPOTENCY_TTL_SECONDS=86400
@@ -492,18 +528,47 @@ SONG_AGENT_API_BINDING_CODE_TTL_SECONDS=600
 ### 5.2 视觉和文档配置
 
 ```bash
-# 视觉模型
-SONG_AGENT_VISION_MODEL_ID=kimi-k2.6
+# 视觉模型（Kimi K2.6）
+SONG_AGENT_VISION_ENABLED=true
+SONG_AGENT_VISION_BASE_URL=https://api.moonshot.cn/v1
+SONG_AGENT_VISION_API_KEY=xxx
+SONG_AGENT_VISION_MODEL=kimi-k2.6
+SONG_AGENT_VISION_CONNECT_TIMEOUT_SECONDS=10
+SONG_AGENT_VISION_READ_TIMEOUT_SECONDS=45
+SONG_AGENT_VISION_MAX_RETRIES=0
+SONG_AGENT_VISION_MAX_TOKENS=1600
 SONG_AGENT_VISION_THINKING_ENABLED=false
-SONG_AGENT_VISION_MAX_TOKENS=800
-SONG_AGENT_VISION_TIMEOUT_SECONDS=45
+SONG_AGENT_VISION_MAX_IMAGE_MB=20
+SONG_AGENT_VISION_MAX_IMAGES_PER_MESSAGE=4
 
-# 文档解析
+# 语音识别
+SONG_AGENT_ASR_ENABLED=true
+SONG_AGENT_ASR_BASE_URL=http://internal:25570
+SONG_AGENT_ASR_PATH=/api/v1/asr
+SONG_AGENT_ASR_DEFAULT_LANGUAGE=auto
+SONG_AGENT_ASR_CONNECT_TIMEOUT_SECONDS=10
+SONG_AGENT_ASR_READ_TIMEOUT_SECONDS=300
+SONG_AGENT_ASR_MAX_AUDIO_MB=100
+
+# 文档解析（MinerU VL）
 SONG_AGENT_DOCUMENT_PARSER_ENABLED=true
 SONG_AGENT_DOCUMENT_PARSER_PROVIDER=mineru_vl
+SONG_AGENT_DOCUMENT_PARSE_TIMEOUT_SECONDS=300
+SONG_AGENT_DOCUMENT_MAX_FILE_MB=50
+SONG_AGENT_DOCUMENT_MAX_CONTEXT_CHARS=4000
 SONG_AGENT_MINERU_VL_BASE_URL=http://internal:63359/v1
 SONG_AGENT_MINERU_VL_READ_TIMEOUT_SECONDS=300
 SONG_AGENT_MINERU_VL_MAX_PAGES=100
+```
+
+### 5.3 搜索引擎配置
+
+```bash
+# 搜索引擎 API Keys（至少配置一个）
+SEARXNG_BASE_URL=https://searx.be
+TALORDATA_API_KEY=xxx
+YDC_API_KEY=xxx
+TAVILY_API_KEY=xxx
 ```
 
 ---
@@ -697,6 +762,11 @@ song_agent/
 
 - `test_agent_api.py`: OpenAI 兼容 API 测试
 - `test_attachments.py`: 附件服务测试
+- `test_search_mcp.py`: 搜索 MCP 集成测试
+- `test_agent_runtime.py`: ReAct 运行时测试
+- `test_workflow_messages.py`: 工作流消息处理测试
+- `test_intent_extractor.py`: 意图提取测试（包含批量提醒、绑定命令识别）
+- `test_transport.py`: 飞书传输层测试
 
 ### 9.2 测试命令
 
@@ -709,6 +779,9 @@ uv run pytest tests/test_agent_api.py -v
 
 # 运行附件相关测试
 uv run pytest tests/test_attachments.py -v
+
+# 运行搜索相关测试
+uv run pytest tests/test_search_mcp.py -v
 ```
 
 ---
@@ -766,6 +839,13 @@ uv run pytest tests/test_attachments.py -v
 - **生命周期**：自动清理过期文件
 - **安全隔离**：租户、应用、用户三层隔离
 
+### 11.4 为什么选择 MCP 进行搜索集成？
+
+- **标准化协议**：Model Context Protocol 是 AI 工具的标准协议
+- **多引擎支持**：search-engine-tool-mcp 提供统一接口，支持多个搜索引擎
+- **灵活配置**：按需配置 API Key，自动选择可用引擎
+- **易于扩展**：新增引擎只需更新 MCP server，无需修改 Song Agent 代码
+
 ---
 
 ## 十二、未来规划
@@ -795,9 +875,22 @@ uv run pytest tests/test_attachments.py -v
 Song Agent 3.0 在 2.1 稳固的分层架构基础上，新增：
 
 1. **OpenAI 兼容 API**：外部系统可通过标准 OpenAI SDK 集成
-2. **多模态处理**：图片理解、语音转写、文档解析
+2. **多模态处理**：图片理解（Kimi K2.6）、语音转写、文档解析（MinerU VL）
 3. **渠道绑定**：API 用户绑定飞书身份，实现消息推送
 4. **幂等性保证**：API 级别的请求幂等
 5. **流式响应**：SSE 格式的实时输出
+6. **网络搜索**：通过 search-engine-tool-mcp 集成 SearXNG、TalorData、You.com、Tavily
+
+### 已实现的关键能力
+
+| 功能模块 | 状态 | 说明 |
+|---------|------|------|
+| OpenAI 兼容 API | ✅ 生产就绪 | 支持 `/api/v1/chat/completions`、幂等性、用户隔离 |
+| 附件处理 | ✅ 生产就绪 | 图片、语音、PDF 解析，自动清理过期文件 |
+| 渠道绑定 | ✅ 生产就绪 | API 用户绑定飞书身份，绑定码 600 秒过期 |
+| 网络搜索 | ✅ 生产就绪 | 多搜索引擎 MCP 集成，自动选择可用引擎 |
+| 上下文管理 | ✅ 生产就绪 | 六层上下文架构，附件规则注入，指代解析 |
+| 批量提醒 | ✅ 生产就绪 | 支持批量创建提醒，如"每天早上九点提醒我开会" |
+| 群聊自动登记 | ✅ 生产就绪 | 机器人被拉入新群后首次 @ 自动登记 |
 
 所有核心功能已实现并通过测试，可以安全地部署到生产环境。

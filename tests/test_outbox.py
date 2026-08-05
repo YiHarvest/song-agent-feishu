@@ -11,7 +11,7 @@ from song_agent.services.outbox import ActionOutboxWorker
 from song_agent.services.pending_actions import PendingActionService
 from song_agent.services.reconciliation import ActionReconciliationService
 from song_agent.store import SqliteStore
-from tests.test_pending_actions import message, record
+from tests.test_pending_actions import message
 
 
 async def _store(path: Path) -> SqliteStore:
@@ -30,10 +30,12 @@ async def test_outbox_executes_confirmed_action_after_callback_process_is_gone(
 ) -> None:
     store = await _store(tmp_path / "state.db")
     try:
-        action = await PendingActionService(store).create_calendar_action(
+        action = await PendingActionService(store).create_action(
             message(),
-            record(store),
-            {"A1"},
+            action_type="calendar.create",
+            payload={"summary": "开会", "start_time": "2026-07-24T10:00:00+08:00"},
+            idempotency_key="outbox-test",
+            source="test",
         )
         assert await store.claim_pending_action(
             action.action_id,
@@ -42,7 +44,8 @@ async def test_outbox_executes_confirmed_action_after_callback_process_is_gone(
         )
         executed: list[str] = []
 
-        async def execute(candidate: PendingAction) -> None:
+        async def execute(candidate: PendingAction, context: object) -> None:
+            del context
             if await store.claim_action_execution(candidate.action_id, worker_id="outbox"):
                 executed.append(candidate.action_id)
                 await store.finish_pending_action(candidate.action_id, success=True)
@@ -67,10 +70,12 @@ async def test_expired_execution_becomes_unknown_and_is_not_blindly_retried(
 ) -> None:
     store = await _store(tmp_path / "state.db")
     try:
-        action = await PendingActionService(store).create_calendar_action(
+        action = await PendingActionService(store).create_action(
             message(),
-            record(store),
-            {"A1"},
+            action_type="calendar.create",
+            payload={"summary": "开会", "start_time": "2026-07-24T10:00:00+08:00"},
+            idempotency_key="outbox-test",
+            source="test",
         )
         assert await store.claim_pending_action(
             action.action_id,

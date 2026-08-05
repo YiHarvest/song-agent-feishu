@@ -29,7 +29,7 @@ async def chat(
     request: Request,
     identity: Annotated[FeishuIdentity, Depends(current_identity)],
 ) -> ApplicationResult:
-    return await request.app.state.request_router.handle(
+    return await request.app.state.dispatcher.dispatch(
         UserRequest(
             identity=identity,
             text=body.text,

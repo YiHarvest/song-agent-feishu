@@ -19,6 +19,9 @@ from ..config import Settings
 class MinerUDocumentClient:
     """公司 MinerU VL 两阶段 PDF 解析客户端。"""
 
+    # 升级模型/服务/解析 Prompt/输出结构时必须 bump；超时/重试/日志不需要。
+    processor_version = "mineru-v1"
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.logger = logging.getLogger(__name__)

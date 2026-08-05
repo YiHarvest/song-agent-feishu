@@ -52,8 +52,18 @@ def test_open_agent_exposes_search_mcp_for_search_requests() -> None:
     capabilities = runtime._infer_capabilities(context, [])
     schemas = registry.schemas_for(context, capabilities)
 
-    assert capabilities == {"websearch"}
+    assert capabilities == {"search"}
+    # Q3: tool_results.read 不随 search 能力默认暴露，仅观察含 result_ref 后加入
     assert {schema["name"] for schema in schemas} == {
+        "websearch.search",
+    }
+
+    # 搜索已执行后，后续步骤可以读取完整结果
+    observations = [{"tool": "websearch.search", "status": "ok", "summary": "找到 5 条"}]
+    capabilities_after = runtime._infer_capabilities(context, observations)
+    schemas_after = registry.schemas_for(context, capabilities_after)
+    assert capabilities_after == {"search", "tool_result"}
+    assert {schema["name"] for schema in schemas_after} == {
         "websearch.search",
         "tool_results.read",
     }

@@ -846,8 +846,8 @@ async def test_request_router_preserves_attachment_retrieved_context() -> None:
         async def build_for_intent_extraction(self, request):
             return object()
 
-    class AgentContexts:
-        def metadata(self, business):
+    class AgentInputs:
+        def build_metadata(self, business):
             return {"business": "kept", "retrieved_context": []}
 
     class General:
@@ -864,7 +864,7 @@ async def test_request_router_preserves_attachment_retrieved_context() -> None:
         General(),  # type: ignore[arg-type]
         Business(),  # type: ignore[arg-type]
         Conversations(),  # type: ignore[arg-type]
-        AgentContexts(),  # type: ignore[arg-type]
+        AgentInputs(),  # type: ignore[arg-type]
     )
     await router.handle(
         UserRequest(

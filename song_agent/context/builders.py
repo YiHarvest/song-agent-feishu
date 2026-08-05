@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 from ..domain.intents import UserRequest
 from ..store import SqliteStore
-from .models import BusinessContext, ContextBudget, RequestContext
+from .models import BusinessContext, RequestContext
 
 
 class BusinessContextBuilder:
@@ -82,51 +82,3 @@ class BusinessContextBuilder:
             current_time=datetime.now(ZoneInfo(self.timezone)),
             session_id=hashlib.sha256(session_raw.encode()).hexdigest(),
         )
-
-
-class AgentRuntimeContextBuilder:
-    """按预算把六层上下文压成开放 Agent 的运行时元数据。"""
-
-    def __init__(self, budget: ContextBudget | None = None) -> None:
-        self.budget = budget or ContextBudget()
-
-    def metadata(self, context: BusinessContext) -> dict:
-        recent = [
-            {"role": message.role, "content": message.content}
-            for message in context.recent_messages
-        ]
-        summary = (
-            context.conversation_summary.model_dump(mode="json")
-            if context.conversation_summary
-            else {}
-        )
-        memories = [memory.model_dump(mode="json") for memory in context.memories]
-        sections = {
-            "request_context": context.request.model_dump(mode="json"),
-            "business_context": {
-                "active_pending_action": context.active_pending_action,
-            },
-            "conversation_context": recent,
-            "summary_context": summary,
-            "memory_context": memories,
-            "retrieved_context": context.retrieved,
-        }
-        return _fit_budget(sections, self.budget.available_tokens)
-
-
-def _fit_budget(sections: dict, max_tokens: int) -> dict:
-    """保留必需层，按低优先级裁剪可选列表。"""
-
-    def estimate(value: object) -> int:
-        return max(1, len(str(value)) // 3)
-
-    while estimate(sections) > max_tokens:
-        if sections["retrieved_context"]:
-            sections["retrieved_context"] = {}
-        elif sections["memory_context"]:
-            sections["memory_context"].pop()
-        elif len(sections["conversation_context"]) > 4:
-            sections["conversation_context"].pop(0)
-        else:
-            break
-    return sections

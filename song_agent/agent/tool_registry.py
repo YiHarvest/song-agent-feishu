@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from .capabilities import NAMESPACE_TO_CAPABILITIES, TOOL_TO_CAPABILITIES
 from .context import AgentContext
 from .models import ToolResult
 
@@ -93,26 +94,14 @@ class ToolRegistry:
         Returns:
             如果匹配返回 True
         """
-        # 工具名称到能力的映射
-        tool_capabilities = {
-            "calendar": {"calendar"},
-            "plans": {"plans"},
-            "reviews": {"plans"},
-            "documents": {"documents"},
-            "websearch": {"websearch"},
-            "tool_results": {"websearch"},
-            "attachments": {"attachments"},
-            "user_preferences": {"preferences"},
-            "ask_user": {"interaction"},
-            "final_answer": {"answer"},
-        }
-
-        # 工具以 namespace.action 命名，能力映射按 namespace 维护。
+        # 工具名到能力的映射集中维护在 agent/capabilities.py。
+        # 精确工具名优先；未注册的新工具按 namespace 前缀兼容。
+        exact_caps = TOOL_TO_CAPABILITIES.get(tool.name, frozenset())
+        if exact_caps & capabilities:
+            return True
         namespace = tool.name.partition(".")[0]
-        tool_caps = tool_capabilities.get(namespace, set())
-
-        # 如果工具的能力与所需能力有交集，则匹配
-        return bool(tool_caps & capabilities)
+        namespace_caps = NAMESPACE_TO_CAPABILITIES.get(namespace, frozenset())
+        return bool(namespace_caps & capabilities)
 
     def get(self, name: str) -> AgentTool | None:
         return self._tools.get(name)

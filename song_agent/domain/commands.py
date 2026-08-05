@@ -40,14 +40,6 @@ class CalendarCreateCommand(BaseModel):
         return list(dict.fromkeys(value))
 
 
-class DirectPendingActionCommand(BaseModel):
-    action: Literal[
-        "pending_action.confirm",
-        "pending_action.cancel",
-        "pending_action.retry",
-    ]
-    action_id: str = Field(min_length=1)
-
 
 class CalendarQueryCommand(BaseModel):
     query: str = Field(default="", max_length=255)

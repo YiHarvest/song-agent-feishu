@@ -191,7 +191,7 @@ async def health(request: Request, credential: Credential) -> dict[str, Any]:
     "/health/details",
     summary="详细健康检查",
     description=(
-        "检查数据库、RequestRouter、Scheduler、Outbox 和 API Key 配置。"
+        "检查数据库、Dispatcher、Scheduler、Outbox 和 API Key 配置。"
         "仅在 SONG_AGENT_API_HEALTH_DETAILS_ENABLED=true 时开放。"
     ),
     response_description="详细组件状态。",
@@ -210,7 +210,7 @@ async def health_details(request: Request, credential: Credential) -> dict[str, 
     return {
         "status": "ok",
         "database": "ok",
-        "request_router": "ok" if request.app.state.request_router else "unavailable",
+        "dispatcher": "ok" if request.app.state.dispatcher else "unavailable",
         "scheduler": "ok",
         "outbox": "ok",
         "api_key_configured": bool(settings.song_agent_api_key),

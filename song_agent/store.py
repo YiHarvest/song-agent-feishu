@@ -498,7 +498,6 @@ class SqliteStore:
         await self.db.execute("DELETE FROM processed_events WHERE processed_at < ?", (cutoff,))
         await self.db.commit()
         self.path.chmod(0o600)
-        await self._import_legacy_json_once()
 
     async def close(self) -> None:
         if self._db is not None:
@@ -2202,14 +2201,28 @@ class SqliteStore:
         await self.db.commit()
         return cursor.rowcount == 1
 
-    async def _import_legacy_json_once(self) -> None:
+    async def import_legacy_json_once(self) -> dict[str, int]:
+        """一次性导入旧版 JSON 数据文件（显式维护工具调用）。
+
+        正常启动流程不再自动调用；只有 `maintenance.legacy_json_import`
+        显式工具或运维脚本才会触发。重复执行幂等：已写入
+        `legacy_json_sha256` 元数据后直接返回空计数。
+        """
+        imported = {
+            "records": 0,
+            "tokens": 0,
+            "processed_events": 0,
+            "group_chats": 0,
+            "p2p_chats": 0,
+            "document_bindings": 0,
+        }
         if not self.legacy_json_path or not self.legacy_json_path.is_file():
-            return
+            return imported
         cursor = await self.db.execute(
             "SELECT value FROM metadata WHERE key = 'legacy_json_sha256'"
         )
         if await cursor.fetchone():
-            return
+            return imported
         raw = self.legacy_json_path.read_bytes()
         payload = json.loads(raw)
         state = _normalize_legacy_state(payload)
@@ -2225,6 +2238,7 @@ class SqliteStore:
                 if record.key.count(":") == 2:
                     record.key = self.record_key(record.chat_id, record.user_id, record.date)
                 await self.save_record_without_commit(record)
+                imported["records"] += 1
             for user_id, value in state["auth"].items():
                 try:
                     token = OAuthToken.model_validate({"user_id": user_id, **value})
@@ -2232,6 +2246,7 @@ class SqliteStore:
                     continue
                 token.app_id = token.app_id or self.app_id
                 await self.save_token_without_commit(token)
+                imported["tokens"] += 1
             for event_id in state["processed_message_ids"]:
                 await self.db.execute(
                     """
@@ -2240,6 +2255,7 @@ class SqliteStore:
                     """,
                     (event_id, int(time.time())),
                 )
+                imported["processed_events"] += 1
             for chat_id in state["group_chat_ids"]:
                 await self.db.execute(
                     """
@@ -2248,6 +2264,7 @@ class SqliteStore:
                     """,
                     (self.app_id, chat_id, int(time.time())),
                 )
+                imported["group_chats"] += 1
             for user_id, chat_id in state["p2p_chat_ids"].items():
                 await self.db.execute(
                     """
@@ -2256,12 +2273,14 @@ class SqliteStore:
                     """,
                     (self.app_id, user_id, chat_id, int(time.time())),
                 )
+                imported["p2p_chats"] += 1
             for value in state["document_bindings"].values():
                 try:
                     binding = DocumentBinding.model_validate(value)
                 except Exception:
                     continue
                 await self.save_document_binding_without_commit(binding)
+                imported["document_bindings"] += 1
             await self.db.execute(
                 "INSERT INTO metadata(key, value) VALUES ('legacy_json_sha256', ?)",
                 (hashlib.sha256(raw).hexdigest(),),
@@ -2270,6 +2289,7 @@ class SqliteStore:
         except Exception:
             await self.db.rollback()
             raise
+        return imported
 
     async def save_record_without_commit(self, record: DailyRecord) -> None:
         await self.db.execute(

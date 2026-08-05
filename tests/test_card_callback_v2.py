@@ -10,8 +10,8 @@ from lark_oapi.core.const import (
 from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTrigger
 
 from song_agent.app import _lark_sdk_headers
+from song_agent.channels.feishu.card_handler import FeishuCardHandler
 from song_agent.domain.results import ApplicationResult
-from song_agent.feishu.callbacks import FeishuCardCallbacks
 
 
 class Service:
@@ -25,6 +25,10 @@ class Service:
     async def cancel(self, identity, action_id, *, event_id=""):
         self.calls.append((event_id, action_id))
         return ApplicationResult(status="ok", message="已取消。")
+
+    async def retry(self, identity, action_id, *, event_id=""):
+        self.calls.append((event_id, action_id))
+        return ApplicationResult(status="ok", message="已重新入队。")
 
 
 def callback() -> P2CardActionTrigger:
@@ -68,7 +72,7 @@ def test_lark_sdk_headers_restore_names_from_asgi_lowercase_headers() -> None:
 @pytest.mark.asyncio
 async def test_v2_callback_uses_sdk_object_value_and_returns_toast_immediately() -> None:
     service = Service()
-    handler = FeishuCardCallbacks(service, asyncio.get_running_loop())
+    handler = FeishuCardHandler(service, asyncio.get_running_loop())
     started = time.perf_counter()
     response = await asyncio.to_thread(handler.handle, callback())
     assert time.perf_counter() - started < 1

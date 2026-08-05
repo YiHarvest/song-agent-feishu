@@ -6,7 +6,7 @@ import pytest
 
 from song_agent.domain.results import ExecutionContext
 from song_agent.executors.calendar_executor import CalendarCreateExecutor
-from song_agent.executors.registry import ExecutorRegistry
+from song_agent.executors.registry import ExecutorNotFound, ExecutorRegistry
 from song_agent.feishu.openapi import FeishuApiError
 from song_agent.models import IncomingMessage, UserTokenContext
 from song_agent.services.encryption import AesGcmTokenCipher
@@ -63,12 +63,8 @@ class Transport:
 
 
 @pytest.mark.asyncio
-async def test_registry_routes_plan_calendar_payload_to_legacy_handler() -> None:
-    legacy_actions = []
+async def test_registry_dispatches_to_registered_executor() -> None:
     direct_actions = []
-
-    async def legacy_handler(action):
-        legacy_actions.append(action)
 
     class DirectExecutor:
         action_type = "calendar.create"
@@ -76,44 +72,27 @@ async def test_registry_routes_plan_calendar_payload_to_legacy_handler() -> None
         async def execute(self, action, context):
             direct_actions.append((action, context))
 
-    registry = ExecutorRegistry(legacy_handler=legacy_handler)
-    registry.register(DirectExecutor())
-    plan_action = SimpleNamespace(
-        action_type="calendar.create",
-        payload={"record_key": "plan-record"},
-    )
-
-    await registry.execute(plan_action)
-
-    assert legacy_actions == [plan_action]
-    assert direct_actions == []
-
-
-@pytest.mark.asyncio
-async def test_registry_keeps_direct_calendar_payload_on_executor() -> None:
-    legacy_actions = []
-    direct_actions = []
-
-    async def legacy_handler(action):
-        legacy_actions.append(action)
-
-    class DirectExecutor:
-        action_type = "calendar.create"
-
-        async def execute(self, action, context):
-            direct_actions.append((action, context))
-
-    registry = ExecutorRegistry(legacy_handler=legacy_handler)
+    registry = ExecutorRegistry()
     registry.register(DirectExecutor())
     direct_action = SimpleNamespace(
         action_type="calendar.create",
         payload={"summary": "开会"},
     )
 
-    await registry.execute(direct_action)
+    await registry.execute(direct_action, SimpleNamespace(worker_id="w1"))
 
-    assert legacy_actions == []
     assert direct_actions[0][0] is direct_action
+
+
+@pytest.mark.asyncio
+async def test_registry_raises_executor_not_found_for_unregistered_type() -> None:
+    registry = ExecutorRegistry()
+    action = SimpleNamespace(action_type="unknown.type", payload={})
+
+    with pytest.raises(ExecutorNotFound) as exc_info:
+        await registry.execute(action, SimpleNamespace(worker_id="w1"))
+
+    assert exc_info.value.action_type == "unknown.type"
 
 
 async def setup_action(tmp_path: Path):

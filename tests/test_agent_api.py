@@ -114,8 +114,7 @@ class FakeRouter:
     def __init__(self) -> None:
         self.requests = []
 
-    async def handle(self, request, direct_action=None):
-        del direct_action
+    async def dispatch(self, request):
         self.requests.append(request)
         return ApplicationResult(
             status="ok",

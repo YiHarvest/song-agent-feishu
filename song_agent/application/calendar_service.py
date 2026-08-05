@@ -19,6 +19,7 @@ from ..domain.results import ApplicationResult
 from ..feishu.oauth import FeishuOAuth
 from ..feishu.openapi import FeishuApiError, FeishuOpenApi
 from ..models import IncomingMessage
+from ..modules.oauth.resume_models import resume_payload_json
 from ..services.pending_actions import PendingActionService
 
 
@@ -65,7 +66,7 @@ class CalendarApplicationService:
                 request.identity,
                 request.chat_id,
                 required_scopes,
-                original_request=request.text,
+                original_request=resume_payload_json(request),
             )
             return ApplicationResult(
                 status="authorization_required",
@@ -119,7 +120,7 @@ class CalendarApplicationService:
                 request.identity,
                 request.chat_id,
                 ("calendar:calendar.event:read",),
-                original_request=request.text,
+                original_request=resume_payload_json(request),
             )
             return ApplicationResult(
                 status="authorization_required",

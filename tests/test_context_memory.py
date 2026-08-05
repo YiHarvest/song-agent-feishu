@@ -2,7 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from song_agent.context.builders import AgentRuntimeContextBuilder, BusinessContextBuilder
+from song_agent.application.context.agent_input_builder import AgentInputBuilder
+from song_agent.context.builders import BusinessContextBuilder
 from song_agent.context.models import ContextBudget, ConversationSummary
 from song_agent.context.service import ConversationContextService
 from song_agent.domain.intents import UserRequest
@@ -139,9 +140,9 @@ async def test_context_is_tenant_and_principal_scoped_and_has_six_layers(
         other = await builder.build_for_intent_extraction(
             request("other", open_id="open-b")
         )
-        metadata = AgentRuntimeContextBuilder(
+        metadata = AgentInputBuilder(
             ContextBudget(max_input_tokens=300, reserved_output_tokens=50)
-        ).metadata(own)
+        ).build_metadata(own)
 
         assert own.recent_messages
         assert other.recent_messages == []

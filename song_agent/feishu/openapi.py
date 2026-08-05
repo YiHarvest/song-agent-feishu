@@ -36,7 +36,7 @@ from ..domain.commands import (
     TaskUpdateCommand,
 )
 from ..models import DailyRecord, PlanTask, UserTokenContext
-from .mcp import CreatedDocument, FoundDocument, markdown_to_text_blocks, sanitize_title
+from .documents import CreatedDocument, FoundDocument, markdown_to_text_blocks, sanitize_title
 
 
 @dataclass

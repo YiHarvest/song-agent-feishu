@@ -273,6 +273,12 @@ async def test_version_one_json_is_imported_once_without_shared_record(tmp_path:
     )
     store = await make_store(tmp_path, legacy=legacy)
     try:
+        # 正常启动不再自动导入旧 JSON；必须显式调用一次性迁移工具逻辑。
+        imported = await store.import_legacy_json_once()
+        assert imported["processed_events"] == 1
+        # 幂等：第二次调用不再导入
+        again = await store.import_legacy_json_once()
+        assert again["processed_events"] == 0
         assert await store.has_processed_message("message-1")
         assert await store.p2p_chat_ids() == {"user-a": "p2p-chat"}
         assert await store.get_record("group", "user-a", "2026-07-22") is None

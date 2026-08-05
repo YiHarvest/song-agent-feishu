@@ -16,6 +16,9 @@ from ..config import Settings
 
 
 class VisionClient:
+    # 升级模型/服务/解析 Prompt/输出结构时必须 bump；超时/重试/日志不需要。
+    processor_version = "vision-v1"
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.logger = logging.getLogger(__name__)

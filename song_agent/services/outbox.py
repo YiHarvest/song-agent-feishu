@@ -6,10 +6,12 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 
+from ..domain.results import ExecutionContext, ExecutionResult
+from ..executors.registry import ExecutorNotFound
 from ..models import PendingAction
 from ..store import SqliteStore
 
-ActionHandler = Callable[[PendingAction], Awaitable[None]]
+ActionHandler = Callable[[PendingAction, ExecutionContext], Awaitable[ExecutionResult]]
 ReconcileHandler = Callable[[PendingAction], Awaitable[bool]]
 
 
@@ -68,7 +70,23 @@ class ActionOutboxWorker:
                     action.status,
                 )
                 try:
-                    await self.execute(action)
+                    await self.execute(
+                        action,
+                        ExecutionContext(worker_id=f"outbox:{action.action_id}"),
+                    )
+                except ExecutorNotFound:
+                    # 未注册执行器的动作是结构性问题，不能进入普通重试分支。
+                    await self.store.complete_pending_action(
+                        action.action_id,
+                        status="failed_final",
+                        error_code="executor_not_found",
+                        error_message=f"no executor for action type: {action.action_type}",
+                    )
+                    self.logger.error(
+                        "Action outbox 无执行器 action_id=%s action_type=%s，已终止",
+                        action.action_id,
+                        action.action_type,
+                    )
                 except Exception:
                     self.logger.exception(
                         "Action outbox 分发异常 action_id=%s action_type=%s",

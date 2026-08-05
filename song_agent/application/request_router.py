@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import re
 
-from ..context.builders import AgentRuntimeContextBuilder, BusinessContextBuilder
+from ..context.builders import BusinessContextBuilder
 from ..context.service import ConversationContextService
-from ..domain.commands import DirectPendingActionCommand
 from ..domain.intents import DETERMINISTIC_INTENTS, UserRequest
 from ..domain.results import ApplicationResult
 from ..intelligence.general_agent import GeneralAgent
 from ..intelligence.intent_extractor import IntentExtractor
 from ..llm import LLMTimeoutError
 from .calendar_service import CalendarApplicationService
+from .context.agent_input_builder import AgentInputBuilder
 from .pending_action_service import PendingActionApplicationService
 from .reminder_service import ReminderApplicationService
 from .task_service import TaskApplicationService
@@ -29,7 +29,7 @@ class RequestRouter:
         general_agent: GeneralAgent,
         business_contexts: BusinessContextBuilder,
         conversation_contexts: ConversationContextService,
-        agent_contexts: AgentRuntimeContextBuilder,
+        agent_inputs: AgentInputBuilder,
         *,
         minimum_confidence: float = 0.65,
     ) -> None:
@@ -41,19 +41,14 @@ class RequestRouter:
         self.general_agent = general_agent
         self.business_contexts = business_contexts
         self.conversation_contexts = conversation_contexts
-        self.agent_contexts = agent_contexts
+        self.agent_inputs = agent_inputs
         self.minimum_confidence = minimum_confidence
 
     async def handle(
         self,
         request: UserRequest,
-        direct_action: DirectPendingActionCommand | None = None,
     ) -> ApplicationResult:
         await self.conversation_contexts.record_user(request)
-        if direct_action:
-            result = await self._dispatch_pending(request, direct_action)
-            await self.conversation_contexts.record_assistant(request, result.message)
-            return result
         business_context = await self.business_contexts.build_for_intent_extraction(
             request
         )
@@ -123,7 +118,7 @@ class RequestRouter:
                 message=f"{extracted.intent} 已进入确定性路由，但该业务服务尚未启用。",
             )
         else:
-            agent_metadata = self.agent_contexts.metadata(business_context)
+            agent_metadata = self.agent_inputs.build_metadata(business_context)
             reference_context = _resolve_reference_context(request, business_context)
             if reference_context:
                 agent_metadata["reference_context"] = reference_context
@@ -147,17 +142,6 @@ class RequestRouter:
             result = await self.general_agent.run(enriched)
         await self.conversation_contexts.record_assistant(request, result.message)
         return result
-
-    async def _dispatch_pending(
-        self,
-        request: UserRequest,
-        command: DirectPendingActionCommand,
-    ) -> ApplicationResult:
-        if command.action == "pending_action.confirm":
-            return await self.pending_actions.confirm(request.identity, command.action_id)
-        if command.action == "pending_action.cancel":
-            return await self.pending_actions.cancel(request.identity, command.action_id)
-        return await self.pending_actions.retry(request.identity, command.action_id)
 
 
 def _resolve_reference_context(

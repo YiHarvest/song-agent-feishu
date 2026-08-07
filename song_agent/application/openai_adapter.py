@@ -1,4 +1,4 @@
-"""Protocol adapter from OpenAI Chat Completions to the shared RequestRouter."""
+"""Protocol adapter from OpenAI Chat Completions to the shared ApplicationDispatcher."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from ..domain.intents import UserRequest
 from ..domain.results import ApplicationResult
 from ..models import ApiChannelBinding, FeishuIdentity
 from ..store import SqliteStore
-from .request_router import RequestRouter
+from .dispatcher import ApplicationDispatcher
 from .result_renderer import render_message
 
 _SUPPORTED_FIELDS = {
@@ -53,11 +53,11 @@ class OpenAIAdapter:
         self,
         settings: Settings,
         store: SqliteStore,
-        request_router: RequestRouter,
+        dispatcher: ApplicationDispatcher,
     ) -> None:
         self.settings = settings
         self.store = store
-        self.request_router = request_router
+        self.dispatcher = dispatcher
         self.logger = logging.getLogger(__name__)
 
     async def complete(
@@ -136,7 +136,7 @@ class OpenAIAdapter:
         )
         try:
             result = await asyncio.wait_for(
-                self.request_router.handle(request=user_request, direct_action=None),
+                self.dispatcher.dispatch(request=user_request),
                 timeout=self.settings.song_agent_api_sync_timeout_seconds,
             )
             response = self._response(payload, result, request_id)

@@ -1,9 +1,9 @@
 """HTTP API 身份依赖。"""
 
 import uuid
-from typing import Annotated
+from typing import Annotated, Any
 
-from fastapi import Header, HTTPException, Request
+from fastapi import Depends, Header, HTTPException, Request
 from pydantic import BaseModel
 
 from ..domain.intents import UserRequest
@@ -14,6 +14,17 @@ class ApiRequestMeta(BaseModel):
     request_id: str = ""
     chat_id: str = ""
     thread_id: str = ""
+
+
+def get_container(request: Request) -> Any:
+    """返回 app.state.container；未装配时回退到传统 app.state 挂载对象。"""
+    container = getattr(request.app.state, "container", None)
+    if container is not None:
+        return container
+    return request.app.state
+
+
+ContainerDep = Annotated[Any, Depends(get_container)]
 
 
 def user_request(

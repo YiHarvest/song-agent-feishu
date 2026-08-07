@@ -21,6 +21,7 @@ from song_agent.domain.intents import UserRequest
 from song_agent.domain.results import ApplicationResult
 from song_agent.models import FeishuIdentity
 from song_agent.services.api_access import ApiAccessService, binding_code_hash
+from song_agent.services.audit import AuditService
 from song_agent.services.encryption import AesGcmTokenCipher
 from song_agent.services.pending_actions import PendingActionService
 from song_agent.store import SqliteStore
@@ -114,8 +115,7 @@ class FakeRouter:
     def __init__(self) -> None:
         self.requests = []
 
-    async def handle(self, request, direct_action=None):
-        del direct_action
+    async def dispatch(self, request):
         self.requests.append(request)
         return ApplicationResult(
             status="ok",
@@ -381,7 +381,7 @@ async def test_openai_adapter_rejects_non_text_content(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_adapter_reuses_request_router_with_api_identity(tmp_path: Path) -> None:
+async def test_adapter_dispatches_with_api_identity(tmp_path: Path) -> None:
     store = await make_store(tmp_path)
     router = FakeRouter()
     try:
@@ -643,13 +643,24 @@ async def test_feishu_reminder_keeps_original_delivery_target(tmp_path: Path) ->
             del scopes
             return SimpleNamespace(subject_id=identity.subject_id)
 
+    class OpenApi:
+        async def create_calendar_command(self, command, token, *, idempotency_key):
+            del command, token, idempotency_key
+            return {
+                "event_id": "event-1",
+                "calendar_id": "cal-1",
+                "url": "",
+                "request_id": "req-1",
+            }
+
     store = await make_store(tmp_path)
     try:
         calendar = CalendarApplicationService(
             OAuth(),  # type: ignore[arg-type]
             PendingActionService(store),
-            object(),  # type: ignore[arg-type]
+            OpenApi(),  # type: ignore[arg-type]
             default_timezone="Asia/Shanghai",
+            audit=AuditService(store),
         )
         reminder = ReminderApplicationService(calendar)
         request = UserRequest(
@@ -666,24 +677,31 @@ async def test_feishu_reminder_keeps_original_delivery_target(tmp_path: Path) ->
             message_id="feishu-message",
         )
 
-        result = await reminder.prepare_create(
+        result = await reminder.create(
             request,
             {
                 "summary": "喝水",
                 "start_time": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
             },
         )
-        action = await store.get_pending_action(result.action_id)
 
-        assert action is not None
-        assert action.source == "feishu"
-        assert action.tenant_key == "feishu-tenant"
-        assert action.app_id == "feishu-app"
-        assert action.creator_subject_id == "union-user"
-        assert action.creator_open_id == "open-user"
-        assert action.chat_id == "feishu-chat"
-        assert action.thread_id == "feishu-thread"
-        assert "delivery_channel" not in action.payload
-        assert "delivery_binding_id" not in action.payload
+        assert result.status == "ok"
+        assert await store.list_pending_actions(
+            tenant_key="feishu-tenant",
+            app_id="feishu-app",
+            principal_id="union-user",
+        ) == []
+        cursor = await store.db.execute(
+            "SELECT tenant_key, app_id, principal_id, chat_id, thread_id,"
+            " message_id, operation FROM audit_logs WHERE operation = 'reminder.create'"
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row["tenant_key"] == "feishu-tenant"
+        assert row["app_id"] == "feishu-app"
+        assert row["principal_id"] == "union-user"
+        assert row["chat_id"] == "feishu-chat"
+        assert row["thread_id"] == "feishu-thread"
+        assert row["message_id"] == "feishu-message"
     finally:
         await store.close()

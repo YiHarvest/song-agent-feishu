@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from song_agent.feishu import transport
-from song_agent.feishu.mcp import markdown_to_text_blocks
+from song_agent.feishu.documents import markdown_to_text_blocks
 from song_agent.feishu.transport import clean_incoming_text, parse_message_text
 
 

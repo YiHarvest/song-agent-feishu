@@ -21,8 +21,7 @@ from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody, 
 from lark_oapi.ws import Client as WsClient
 
 from ..config import Settings
-from ..feishu.cards import business_confirmation_card, document_confirmation_card
-from ..models import IncomingAttachmentRef, IncomingMessage, PendingAction
+from ..models import IncomingAttachmentRef, IncomingMessage
 from ..store import SqliteStore
 
 MessageHandler = Callable[[IncomingMessage], Awaitable[None]]
@@ -109,22 +108,6 @@ class FeishuTransport:
             },
         }
         return await self.send_card(chat_id, card)
-
-    async def send_confirmation_card(
-        self,
-        chat_id: str,
-        markdown: str,
-        action: PendingAction,
-    ) -> str | None:
-        card = (
-            document_confirmation_card(markdown, action)
-            if action.action_type.startswith("document.")
-            else business_confirmation_card(markdown, action)
-        )
-        message_id = await self.send_card(chat_id, card)
-        if message_id:
-            await self.store.set_pending_action_card_message(action.action_id, message_id)
-        return message_id
 
     async def send_card(self, chat_id: str, card: dict[str, Any]) -> str | None:
         body = (

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from song_agent.attachments.service import PreparedAttachmentMessage
+from song_agent.channels.feishu.response_presenter import confirmation_action_ids
 from song_agent.domain.results import ApplicationResult
 from song_agent.media.vision_client import VisionBusyError, VisionTimeoutError
 from song_agent.models import IncomingAttachmentRef, IncomingMessage
@@ -41,13 +42,22 @@ class BatchTransport(Transport):
         super().__init__()
         self.confirmations = []
 
-    async def send_confirmation_card(self, chat_id, markdown, action):
-        self.confirmations.append((chat_id, action.action_id))
+    async def send_card(self, chat_id, card):
+        self.confirmations.append((chat_id, card))
         return f"confirmation-{len(self.confirmations)}"
 
 
+class BatchPresenter:
+    def __init__(self) -> None:
+        self.presented: list[tuple[str, list[str]]] = []
+
+    async def present(self, chat_id, identity, result):
+        del identity
+        self.presented.append((chat_id, confirmation_action_ids(result)))
+
+
 class Router:
-    async def handle(self, request):
+    async def dispatch(self, request):
         return ApplicationResult(status="ok", message="处理完成")
 
 
@@ -58,8 +68,8 @@ class ConversationContexts:
     async def record_user(self, request) -> None:
         self.recorded.append(("user", request.text))
 
-    async def record_assistant(self, request, content) -> None:
-        del request
+    async def record_assistant(self, request, content, *, message_id="") -> None:
+        del request, message_id
         self.recorded.append(("assistant", content))
 
 
@@ -72,7 +82,7 @@ class BatchRouter:
     def __init__(self, action_ids):
         self.action_ids = action_ids
 
-    async def handle(self, request):
+    async def dispatch(self, request):
         return ApplicationResult(
             status="awaiting_confirmation",
             intent="reminder.batch_create",
@@ -125,13 +135,13 @@ def workflow() -> AgentWorkflow:
     instance.transport = Transport()
     instance.oauth = SimpleNamespace(settings=SimpleNamespace(feishu_app_id="app"))
     instance.planner = SimpleNamespace(today=lambda: "2026-07-26")
-    instance.request_router = Router()
+    instance.dispatcher = Router()
     instance.logger = logging.getLogger("test.workflow.messages")
     return instance
 
 
 @pytest.mark.asyncio
-async def test_general_request_logs_content_and_sends_processing_status(caplog) -> None:
+async def test_general_request_logs_content_and_sends_single_result(caplog) -> None:
     instance = workflow()
 
     with caplog.at_level(logging.INFO, logger="test.workflow.messages"):
@@ -139,7 +149,6 @@ async def test_general_request_logs_content_and_sends_processing_status(caplog) 
 
     assert "content='杭州萧山天气怎么样'" in caplog.text
     assert instance.transport.messages == [
-        ("chat-1", "⏳ 正在处理你的请求，请稍候…"),
         ("chat-1", "处理完成"),
     ]
 
@@ -151,12 +160,13 @@ async def test_batch_result_sends_each_confirmation_card(action_count: int) -> N
     instance = workflow()
     instance.store = BatchStore()
     instance.transport = BatchTransport()
-    instance.request_router = BatchRouter(action_ids)
+    instance.presenter = BatchPresenter()
+    instance.dispatcher = BatchRouter(action_ids)
 
     await instance._handle(incoming(f"创建{action_count}个闹钟"))
 
-    assert instance.transport.confirmations == [
-        ("chat-1", action_id) for action_id in action_ids
+    assert instance.presenter.presented == [
+        ("chat-1", action_ids),
     ]
 
 
@@ -164,7 +174,7 @@ async def test_batch_result_sends_each_confirmation_card(action_count: int) -> N
 async def test_direct_attachment_answer_skips_router() -> None:
     instance = workflow()
     instance.attachment_service = DirectAttachmentService()
-    instance.request_router = ContextRecordingRouter()
+    instance.dispatcher = ContextRecordingRouter()
     media = incoming("").model_copy(
         update={
             "message_type": "image",
@@ -185,7 +195,7 @@ async def test_direct_attachment_answer_skips_router() -> None:
         ("chat-1", "⏳ 已收到图片，正在读取和分析…"),
         ("chat-1", "图片显示数据库连接超时。"),
     ]
-    assert instance.request_router.conversation_contexts.recorded == [
+    assert instance.dispatcher.conversation_contexts.recorded == [
         ("user", "这是什么"),
         ("assistant", "图片显示数据库连接超时。"),
     ]

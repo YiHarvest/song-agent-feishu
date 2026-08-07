@@ -28,7 +28,7 @@ class ContextConfig:
     max_preference_chars: int = 300
 
 
-class AgentContextBuilder:
+class AgentPromptBuilder:
     """
     Agent 上下文构建器。
 

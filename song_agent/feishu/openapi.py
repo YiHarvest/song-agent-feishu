@@ -36,7 +36,8 @@ from ..domain.commands import (
     TaskUpdateCommand,
 )
 from ..models import DailyRecord, PlanTask, UserTokenContext
-from .mcp import CreatedDocument, FoundDocument, markdown_to_text_blocks, sanitize_title
+from ..observability.context import current_trace_id
+from .documents import CreatedDocument, FoundDocument, markdown_to_text_blocks, sanitize_title
 
 
 @dataclass
@@ -312,6 +313,7 @@ class FeishuOpenApi:
         *,
         idempotency_key: str,
     ) -> dict[str, str]:
+        started_at = time.monotonic()
         calendar_id = await self._primary_calendar_id(token_context)
         event = _calendar_event_from_command(command)
         try:
@@ -358,6 +360,15 @@ class FeishuOpenApi:
                     retryable=error.retryable,
                     request_id=error.request_id,
                 ) from error
+        self.logger.info(
+            "直连创建日程 openapi perf trace_id=%s subject=%s total_ms=%d "
+            "event_id=%s calendar_id=%s",
+            current_trace_id(),
+            token_context.subject_id,
+            int((time.monotonic() - started_at) * 1000),
+            event_id,
+            calendar_id,
+        )
         return {
             "event_id": event_id,
             "calendar_id": calendar_id,
@@ -672,10 +683,12 @@ class FeishuOpenApi:
         """获取用户主日历 ID，使用 HTTP API 避免 SDK 返回错误的群组日历"""
         if not force and token_context.subject_id in self._primary_calendar_cache:
             return self._primary_calendar_cache[token_context.subject_id]
+        started_at = time.monotonic()
         self.logger.info(
-            "开始获取用户主日历 subject=%s tenant=%s",
+            "开始获取用户主日历 subject=%s tenant=%s trace_id=%s",
             token_context.subject_id,
             token_context.tenant_key,
+            current_trace_id(),
         )
         async with httpx.AsyncClient(
             base_url=self.settings.domain,
@@ -704,12 +717,13 @@ class FeishuOpenApi:
             raise RuntimeError(f"飞书 OpenAPI 返回非 JSON 响应: HTTP {response.status_code}") from error
         self.logger.info(
             "获取用户主日历响应 subject=%s http_status=%d code=%s msg=%s "
-            "request_id=%s",
+            "request_id=%s trace_id=%s",
             token_context.subject_id,
             response.status_code,
             payload.get("code"),
             payload.get("msg"),
             _response_request_id(response),
+            current_trace_id(),
         )
         if response.is_error or payload.get("code"):
             raise FeishuApiError(
@@ -727,7 +741,13 @@ class FeishuOpenApi:
                 request_id=_response_request_id(response),
             )
         self._primary_calendar_cache[token_context.subject_id] = calendar_id
-        self.logger.info("获取用户主日历成功: %s", calendar_id)
+        self.logger.info(
+            "获取用户主日历成功 subject=%s calendar_id=%s trace_id=%s duration_ms=%d",
+            token_context.subject_id,
+            calendar_id,
+            current_trace_id(),
+            int((time.monotonic() - started_at) * 1000),
+        )
         return calendar_id
 
     async def _create_calendar_event_model(
@@ -765,13 +785,14 @@ class FeishuOpenApi:
         request_id = str(getattr(response, "request_id", "") or "")
         self.logger.info(
             "创建日程响应 subject=%s calendar_id=%s success=%s code=%s "
-            "request_id=%s duration_ms=%d",
+            "request_id=%s duration_ms=%d trace_id=%s",
             token_context.subject_id,
             calendar_id,
             response.success(),
             getattr(response, "code", None),
             request_id,
             int((time.monotonic() - started_at) * 1000),
+            current_trace_id(),
         )
         if not response.success():
             code = int(getattr(response, "code", 0) or 0)

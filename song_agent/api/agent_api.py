@@ -62,7 +62,7 @@ async def retrieve_model(
     summary="创建聊天补全",
     description=(
         "OpenAI Chat Completions 兼容入口。请求会转换为 Song Agent `UserRequest`，"
-        "复用现有 `RequestRouter`。支持普通 JSON 和 `stream=true` SSE 响应。"
+        "复用现有 `ApplicationDispatcher`。支持普通 JSON 和 `stream=true` SSE 响应。"
         "当前只支持文本，`n` 只能为 1，不支持 tools、tool_choice 和 tool role。"
     ),
     response_description="OpenAI Chat Completion 或 SSE 数据流。",
@@ -191,7 +191,7 @@ async def health(request: Request, credential: Credential) -> dict[str, Any]:
     "/health/details",
     summary="详细健康检查",
     description=(
-        "检查数据库、RequestRouter、Scheduler、Outbox 和 API Key 配置。"
+        "检查数据库、Dispatcher、Scheduler、Outbox 和 API Key 配置。"
         "仅在 SONG_AGENT_API_HEALTH_DETAILS_ENABLED=true 时开放。"
     ),
     response_description="详细组件状态。",
@@ -210,7 +210,7 @@ async def health_details(request: Request, credential: Credential) -> dict[str, 
     return {
         "status": "ok",
         "database": "ok",
-        "request_router": "ok" if request.app.state.request_router else "unavailable",
+        "dispatcher": "ok" if request.app.state.dispatcher else "unavailable",
         "scheduler": "ok",
         "outbox": "ok",
         "api_key_configured": bool(settings.song_agent_api_key),

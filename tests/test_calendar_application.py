@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ import pytest
 from song_agent.application.calendar_service import CalendarApplicationService
 from song_agent.application.pending_action_service import PendingActionApplicationService
 from song_agent.domain.intents import UserRequest
+from song_agent.feishu.openapi import FeishuApiError
 from song_agent.models import FeishuIdentity
 from song_agent.services.audit import AuditService
 from song_agent.services.encryption import AesGcmTokenCipher
@@ -24,6 +26,26 @@ class OAuth:
 
     async def create_authorization_url(self, *args, **kwargs):
         return "https://auth.example"
+
+
+class DirectOpenApi:
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    async def create_calendar_command(self, command, token, *, idempotency_key):
+        self.calls.append((command, token, idempotency_key))
+        return {
+            "event_id": f"event-{len(self.calls)}",
+            "calendar_id": "cal-1",
+            "url": "https://feishu.cn/calendar/event-1",
+            "request_id": "req-1",
+        }
+
+
+class FailingOpenApi:
+    async def create_calendar_command(self, command, token, *, idempotency_key):
+        del command, token, idempotency_key
+        raise FeishuApiError("calendar unavailable", code=500, retryable=True)
 
 
 def identity(open_id: str = "open-a") -> FeishuIdentity:
@@ -55,20 +77,30 @@ async def make_store(tmp_path: Path) -> SqliteStore:
     return store
 
 
+def make_service(
+    store: SqliteStore,
+    *,
+    oauth: OAuth | None = None,
+    openapi: object | None = None,
+) -> CalendarApplicationService:
+    return CalendarApplicationService(
+        oauth or OAuth(),
+        PendingActionService(store),
+        openapi or object(),
+        default_timezone="Asia/Shanghai",
+        audit=AuditService(store),
+    )
+
+
 @pytest.mark.asyncio
 async def test_calendar_prepare_defaults_to_60_minutes_and_never_calls_openapi(
     tmp_path: Path,
 ) -> None:
     store = await make_store(tmp_path)
     try:
-        service = CalendarApplicationService(
-            OAuth(),
-            PendingActionService(store),
-            object(),
-            default_timezone="Asia/Shanghai",
-        )
+        service = make_service(store)
         start = datetime.now(UTC) + timedelta(days=1)
-        result = await service.prepare_create(
+        result = await service.prepare_create_confirmation(
             request(),
             {"summary": "喝水", "start_time": start.isoformat()},
         )
@@ -89,19 +121,14 @@ async def test_calendar_prepare_defaults_to_60_minutes_and_never_calls_openapi(
 async def test_calendar_prepare_rejects_past_and_invalid_end(tmp_path: Path) -> None:
     store = await make_store(tmp_path)
     try:
-        service = CalendarApplicationService(
-            OAuth(),
-            PendingActionService(store),
-            object(),
-            default_timezone="Asia/Shanghai",
-        )
+        service = make_service(store)
         past = datetime.now(UTC) - timedelta(hours=1)
-        rejected = await service.prepare_create(
+        rejected = await service.prepare_create_confirmation(
             request(),
             {"summary": "过去", "start_time": past.isoformat()},
         )
         start = datetime.now(UTC) + timedelta(days=1)
-        invalid = await service.prepare_create(
+        invalid = await service.prepare_create_confirmation(
             request(),
             {
                 "summary": "倒序",
@@ -120,13 +147,8 @@ async def test_calendar_prepare_returns_authorization_before_pending_action(
 ) -> None:
     store = await make_store(tmp_path)
     try:
-        service = CalendarApplicationService(
-            OAuth(authorized=False),
-            PendingActionService(store),
-            object(),
-            default_timezone="Asia/Shanghai",
-        )
-        result = await service.prepare_create(
+        service = make_service(store, oauth=OAuth(authorized=False))
+        result = await service.prepare_create_confirmation(
             request(),
             {
                 "summary": "喝水",
@@ -148,14 +170,8 @@ async def test_calendar_prepare_returns_authorization_before_pending_action(
 async def test_pending_action_owner_concurrency_dedupe_and_retry(tmp_path: Path) -> None:
     store = await make_store(tmp_path)
     try:
-        factory = PendingActionService(store)
-        calendar = CalendarApplicationService(
-            OAuth(),
-            factory,
-            object(),
-            default_timezone="Asia/Shanghai",
-        )
-        prepared = await calendar.prepare_create(
+        calendar = make_service(store)
+        prepared = await calendar.prepare_create_confirmation(
             request(),
             {
                 "summary": "喝水",
@@ -202,13 +218,8 @@ async def test_pending_action_rejects_expired_confirm_and_succeeded_retry(
 ) -> None:
     store = await make_store(tmp_path)
     try:
-        calendar = CalendarApplicationService(
-            OAuth(),
-            PendingActionService(store),
-            object(),
-            default_timezone="Asia/Shanghai",
-        )
-        prepared = await calendar.prepare_create(
+        calendar = make_service(store)
+        prepared = await calendar.prepare_create_confirmation(
             request(),
             {
                 "summary": "喝水",
@@ -240,13 +251,8 @@ async def test_pending_action_rejects_expired_confirm_and_succeeded_retry(
 async def test_pending_action_card_event_id_is_deduplicated(tmp_path: Path) -> None:
     store = await make_store(tmp_path)
     try:
-        calendar = CalendarApplicationService(
-            OAuth(),
-            PendingActionService(store),
-            object(),
-            default_timezone="Asia/Shanghai",
-        )
-        prepared = await calendar.prepare_create(
+        calendar = make_service(store)
+        prepared = await calendar.prepare_create_confirmation(
             request(),
             {
                 "summary": "喝水",
@@ -264,5 +270,166 @@ async def test_pending_action_card_event_id_is_deduplicated(tmp_path: Path) -> N
             )
         ).fetchone()
         assert row["count"] == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_calendar_create_direct_executes_without_pending_action(
+    tmp_path: Path,
+) -> None:
+    store = await make_store(tmp_path)
+    openapi = DirectOpenApi()
+    try:
+        service = make_service(store, openapi=openapi)
+        start = datetime.now(UTC) + timedelta(days=1)
+        result = await service.create(
+            request(),
+            {"summary": "项目会议", "start_time": start.isoformat()},
+        )
+        assert result.status == "ok"
+        assert "已创建日程" in result.message
+        assert "项目会议" in result.message
+        assert "时间：" in result.message
+        assert len(openapi.calls) == 1
+        command, token, idempotency_key = openapi.calls[0]
+        assert command.summary == "项目会议"
+        assert idempotency_key
+        assert await store.list_pending_actions(
+            tenant_key="tenant",
+            app_id="app",
+            principal_id="subject-a",
+        ) == []
+        assert await store.ready_outbox_action_ids() == []
+        cursor = await store.db.execute(
+            "SELECT operation, result, metadata_json FROM audit_logs"
+            " WHERE operation = 'calendar.create'"
+        )
+        rows = await cursor.fetchall()
+        assert len(rows) == 1
+        assert rows[0]["result"] == "success"
+        metadata = json.loads(rows[0]["metadata_json"])
+        assert metadata["resource_id"] == "event-1"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_calendar_create_repeated_delivery_uses_same_idempotency_key(
+    tmp_path: Path,
+) -> None:
+    store = await make_store(tmp_path)
+    openapi = DirectOpenApi()
+    try:
+        service = make_service(store, openapi=openapi)
+        arguments = {
+            "summary": "喝水",
+            "start_time": (
+                datetime.now(UTC) + timedelta(days=1)
+            ).isoformat(),
+        }
+        first = await service.create(request(), arguments)
+        second = await service.create(request(), arguments)
+        assert first.status == second.status == "ok"
+        assert len(openapi.calls) == 2
+        assert openapi.calls[0][2] == openapi.calls[1][2], (
+            "同一 message_id 重复投递必须使用相同幂等键"
+        )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_calendar_create_requires_authorization(tmp_path: Path) -> None:
+    store = await make_store(tmp_path)
+    openapi = DirectOpenApi()
+    try:
+        service = make_service(store, oauth=OAuth(authorized=False), openapi=openapi)
+        result = await service.create(
+            request(),
+            {
+                "summary": "喝水",
+                "start_time": (datetime.now(UTC) + timedelta(days=1)).isoformat(),
+            },
+        )
+        assert result.status == "authorization_required"
+        assert result.authorization_url == "https://auth.example"
+        assert openapi.calls == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_calendar_create_with_attendees_goes_confirmation(
+    tmp_path: Path,
+) -> None:
+    store = await make_store(tmp_path)
+    openapi = DirectOpenApi()
+    try:
+        service = make_service(store, openapi=openapi)
+        result = await service.create(
+            request(),
+            {
+                "summary": "会议",
+                "start_time": (datetime.now(UTC) + timedelta(days=1)).isoformat(),
+                "attendee_open_ids": ["open-x"],
+            },
+        )
+        assert result.status == "awaiting_confirmation"
+        assert openapi.calls == []
+        action = await store.get_pending_action(result.action_id)
+        assert action and action.action_type == "calendar.create"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_calendar_create_rejects_invalid_arguments(tmp_path: Path) -> None:
+    store = await make_store(tmp_path)
+    openapi = DirectOpenApi()
+    try:
+        service = make_service(store, openapi=openapi)
+        past = datetime.now(UTC) - timedelta(hours=1)
+        rejected = await service.create(
+            request(),
+            {"summary": "过去", "start_time": past.isoformat()},
+        )
+        start = datetime.now(UTC) + timedelta(days=1)
+        invalid = await service.create(
+            request(),
+            {
+                "summary": "倒序",
+                "start_time": start.isoformat(),
+                "end_time": (start - timedelta(minutes=1)).isoformat(),
+            },
+        )
+        assert rejected.status == invalid.status == "clarification_required"
+        assert openapi.calls == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_calendar_create_error_returns_message(tmp_path: Path) -> None:
+    store = await make_store(tmp_path)
+    try:
+        service = make_service(store, openapi=FailingOpenApi())
+        result = await service.create(
+            request(),
+            {
+                "summary": "喝水",
+                "start_time": (datetime.now(UTC) + timedelta(days=1)).isoformat(),
+            },
+        )
+        assert result.status == "error"
+        assert "创建失败" in result.message
+        cursor = await store.db.execute(
+            "SELECT result, metadata_json FROM audit_logs"
+            " WHERE operation = 'calendar.create'"
+        )
+        rows = await cursor.fetchall()
+        assert rows and rows[0]["result"] == "failed_retryable"
+        metadata = json.loads(rows[0]["metadata_json"])
+        assert metadata["error_code"] == "500"
     finally:
         await store.close()

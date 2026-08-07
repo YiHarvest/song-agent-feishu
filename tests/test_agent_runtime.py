@@ -4,9 +4,9 @@ from typing import Any
 import pytest
 
 from song_agent.agent.context import AgentContext
-from song_agent.agent.context_builder import AgentContextBuilder
+from song_agent.agent.context_builder import AgentPromptBuilder
 from song_agent.agent.models import AgentDecision, ToolResult
-from song_agent.agent.runtime import AgentLimits, ReActRuntime, _normalize_tool_decision
+from song_agent.agent.runtime import ReActRuntime, _normalize_tool_decision
 from song_agent.agent.tool_registry import AgentTool, ToolRegistry
 from song_agent.config import Settings
 from song_agent.llm import LLMOutputTruncatedError
@@ -58,7 +58,7 @@ def runtime(
         FakeLlm(decisions),  # type: ignore[arg-type]
         registry,
         ToolPolicyGuard(),
-        AgentLimits(max_steps=4, max_tool_calls=3, timeout_seconds=5),
+        settings=settings(),
     )
 
 
@@ -82,7 +82,7 @@ def test_settings_accepts_configured_fifteen_tool_calls() -> None:
 
 
 def test_context_builder_preserves_runtime_tool_summary() -> None:
-    summary = AgentContextBuilder().build_tool_result_summary(
+    summary = AgentPromptBuilder().build_tool_result_summary(
         [
             {
                 "tool": "plans.save_draft",
@@ -109,7 +109,7 @@ def test_context_builder_exposes_resolved_reference() -> None:
         "markdown": "需要记录的原句。",
     }
 
-    prompt = AgentContextBuilder().build_user_message(ctx)
+    prompt = AgentPromptBuilder().build_user_message(ctx)
 
     assert "已解析指代" in prompt
     assert "需要记录的原句" in prompt
@@ -124,7 +124,7 @@ def test_context_builder_keeps_image_analysis_for_follow_up() -> None:
         {"role": "assistant", "content": analysis}
     ]
 
-    prompt = AgentContextBuilder().build_user_message(ctx)
+    prompt = AgentPromptBuilder().build_user_message(ctx)
 
     assert analysis in prompt
 
@@ -139,14 +139,14 @@ def test_context_builder_marks_attachment_as_already_processed() -> None:
         }
     ]
 
-    prompt = AgentContextBuilder().build_user_message(ctx)
+    prompt = AgentPromptBuilder().build_user_message(ctx)
 
     assert "附件已在进入 Agent 前完成解析" in prompt
     assert "禁止再次调用图片、语音或文档解析工具" in prompt
 
 
 def test_context_builder_hides_attachment_instructions_without_current_attachment() -> None:
-    prompt = AgentContextBuilder().build_system_prompt(
+    prompt = AgentPromptBuilder().build_system_prompt(
         context(),
         tool_schemas=[],
     )
@@ -162,7 +162,7 @@ def test_context_builder_preserves_nested_plan_tool_schema() -> None:
     plan_tool = workflow._build_tool_registry().get("plans.save_draft")
     assert plan_tool is not None
 
-    prompt = AgentContextBuilder().build_system_prompt(
+    prompt = AgentPromptBuilder().build_system_prompt(
         context(),
         tool_schemas=[plan_tool.schema()],
     )
@@ -192,7 +192,6 @@ async def test_runtime_uses_final_limit_and_compacts_after_truncation() -> None:
         llm,
         ToolRegistry(),
         ToolPolicyGuard(),
-        AgentLimits(),
         settings=configured,
     )
     ctx = context()
@@ -238,7 +237,6 @@ async def test_runtime_repairs_false_general_knowledge_scope_refusal() -> None:
         llm,
         ToolRegistry(),
         ToolPolicyGuard(),
-        AgentLimits(),
         settings=configured,
     )
     ctx = context()
@@ -330,7 +328,6 @@ async def test_budget_allows_exact_configured_number_of_tool_calls() -> None:
         ),
         registry,
         ToolPolicyGuard(),
-        AgentLimits(max_steps=3, max_tool_calls=2, timeout_seconds=60),
         settings=settings(
             agent_max_steps=3,
             agent_max_llm_requests=3,
@@ -392,7 +389,7 @@ async def test_weather_alias_uses_visible_websearch_tool() -> None:
         ),
         registry,
         ToolPolicyGuard(),
-        AgentLimits(max_steps=3, max_tool_calls=2, timeout_seconds=5),
+        settings=settings(),
     )
     ctx = context()
     ctx.user_text = "今天杭州萧山天气怎么样？"
@@ -438,7 +435,7 @@ async def test_latest_news_forces_websearch_when_model_claims_tool_missing() -> 
         ),
         registry,
         ToolPolicyGuard(),
-        AgentLimits(max_steps=3, max_tool_calls=2, timeout_seconds=5),
+        settings=settings(),
     )
     ctx = context()
     ctx.user_text = "谷歌GPT最新消息"
@@ -493,7 +490,7 @@ def test_planning_phrase_selects_plan_tool_schema() -> None:
         FakeLlm([]),
         registry,
         ToolPolicyGuard(),
-        AgentLimits(),
+        settings=settings(),
     )
     ctx = context()
     ctx.user_text = "我今天要吃饭、睡觉、购物，提交宋管家的PR，给我规划一下"
@@ -501,7 +498,8 @@ def test_planning_phrase_selects_plan_tool_schema() -> None:
     capabilities = agent._infer_capabilities(ctx, [])
     schemas = registry.schemas_for(ctx, capabilities)
 
-    assert "plans" in capabilities
+    assert "plan" in capabilities
+    assert "review" in capabilities
     assert {schema["name"] for schema in schemas} == {
         "plans.save_draft",
         "reviews.save",
@@ -526,7 +524,7 @@ def test_image_follow_up_does_not_expose_attachment_tool_without_current_id() ->
         FakeLlm([]),
         registry,
         ToolPolicyGuard(),
-        AgentLimits(),
+        settings=settings(),
     )
     ctx = context()
     ctx.user_text = "这个图中的流程你觉得合理吗"
@@ -537,7 +535,9 @@ def test_image_follow_up_does_not_expose_attachment_tool_without_current_id() ->
     capabilities = agent._infer_capabilities(ctx, [])
     schemas = registry.schemas_for(ctx, capabilities)
 
-    assert "attachments" not in capabilities
+    assert "image" not in capabilities
+    assert "audio" not in capabilities
+    assert "document_parse" not in capabilities
     assert schemas == []
 
 
@@ -564,7 +564,7 @@ def test_processed_audio_does_not_reexpose_attachment_tools() -> None:
         FakeLlm([]),
         registry,
         ToolPolicyGuard(),
-        AgentLimits(),
+        settings=settings(),
     )
     ctx = context()
     ctx.user_text = "杭州萧山今天天气怎么样"
@@ -579,7 +579,7 @@ def test_processed_audio_does_not_reexpose_attachment_tools() -> None:
     capabilities = agent._infer_capabilities(ctx, [])
     schemas = registry.schemas_for(ctx, capabilities)
 
-    assert capabilities == {"websearch"}
+    assert capabilities == {"search"}
     assert schemas == []
 
 
@@ -590,7 +590,7 @@ def test_document_capability_does_not_expose_attachment_parsers() -> None:
         FakeLlm([]),
         registry,
         ToolPolicyGuard(),
-        AgentLimits(),
+        settings=settings(),
     )
     ctx = context()
     ctx.user_text = "把已解析内容写入文档"
@@ -600,7 +600,7 @@ def test_document_capability_does_not_expose_attachment_parsers() -> None:
         schema["name"] for schema in registry.schemas_for(ctx, capabilities)
     }
 
-    assert "documents" in capabilities
+    assert "document_write" in capabilities
     assert not any(name.startswith("attachments.") for name in schema_names)
 
 
@@ -636,7 +636,7 @@ def test_reminder_phrase_does_not_expose_calendar_react_tool(phrase: str) -> Non
         FakeLlm([]),
         registry,
         ToolPolicyGuard(),
-        AgentLimits(),
+        settings=settings(),
     )
     ctx = context()
     ctx.user_text = phrase
@@ -694,7 +694,7 @@ async def test_agent_history_keeps_summaries_and_hashes_without_raw_arguments(
             ),  # type: ignore[arg-type]
             registry,
             ToolPolicyGuard(),
-            AgentLimits(max_steps=4, max_tool_calls=3, timeout_seconds=5),
+            settings=settings(),
             recorder=recorder,
         )
         result = await agent.run(ctx)

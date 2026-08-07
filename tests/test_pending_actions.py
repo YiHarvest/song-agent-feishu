@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from song_agent.feishu.cards import calendar_confirmation_card, document_confirmation_card
+from song_agent.channels.feishu.cards import calendar_confirmation_card, document_confirmation_card
 from song_agent.models import DailyRecord, IncomingMessage, PlanTask
 from song_agent.services.encryption import AesGcmTokenCipher
 from song_agent.services.pending_actions import PendingActionService
@@ -60,7 +60,13 @@ async def test_pending_action_binds_creator_hash_expiry_and_exactly_once(tmp_pat
     await store.initialize()
     try:
         service = PendingActionService(store)
-        action = await service.create_calendar_action(message(), record(store), {"A1"})
+        action = await service.create_action(
+            message(),
+            action_type="calendar.create",
+            payload={"summary": "开会", "start_time": "2026-07-24T10:00:00+08:00"},
+            idempotency_key="bind-test",
+            source="test",
+        )
         card = calendar_confirmation_card("待确认", action)
         serialized = json.dumps(card)
         assert action.action_id in serialized
@@ -124,7 +130,13 @@ async def test_expired_pending_action_cannot_execute(tmp_path: Path) -> None:
     await store.initialize()
     try:
         service = PendingActionService(store, ttl_seconds=-1)
-        action = await service.create_calendar_action(message(), record(store), {"A1"})
+        action = await service.create_action(
+            message(),
+            action_type="calendar.create",
+            payload={"summary": "开会", "start_time": "2026-07-24T10:00:00+08:00"},
+            idempotency_key="bind-test",
+            source="test",
+        )
         assert action.expires_at < int(time.time())
         assert not await store.claim_pending_action(
             action.action_id,

@@ -1,6 +1,6 @@
 """分层上下文、会话摘要与长期记忆。"""
 
-from .builders import AgentRuntimeContextBuilder, BusinessContextBuilder
+from .builders import BusinessContextBuilder
 from .models import (
     BusinessContext,
     ContextBudget,
@@ -12,7 +12,6 @@ from .models import (
 from .service import ConversationContextService
 
 __all__ = [
-    "AgentRuntimeContextBuilder",
     "BusinessContext",
     "BusinessContextBuilder",
     "ContextBudget",

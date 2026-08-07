@@ -7,30 +7,20 @@ import hashlib
 import json
 import logging
 import time
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ..config import Settings
 from ..llm import LLMOutputTruncatedError
 from ..policies.tool_policy import ToolPolicyGuard
 from .budget import AgentRunBudget, BudgetExceededError
+from .capabilities import needs_websearch
 from .context import AgentContext
-from .context_builder import AgentContextBuilder, ContextConfig
+from .context_builder import AgentPromptBuilder, ContextConfig
 from .models import AgentDecision, AgentResult, ToolResult
 from .tool_registry import ToolRegistry
 
 if TYPE_CHECKING:
     from ..services.agent_runs import AgentRunRecorder
-
-
-@dataclass(frozen=True, slots=True)
-class AgentLimits:
-    """Agent 运行限制（已废弃，使用 AgentRunBudget）"""
-
-    max_steps: int = 12
-    max_tool_calls: int = 8
-    max_consecutive_tool_errors: int = 2
-    timeout_seconds: int = 90
 
 
 class ReActRuntime:
@@ -51,20 +41,18 @@ class ReActRuntime:
         llm,
         tools: ToolRegistry,
         policy: ToolPolicyGuard,
-        limits: AgentLimits,
+        settings: Settings,
         recorder: AgentRunRecorder | None = None,
-        settings: Settings | None = None,
     ) -> None:
         self.llm = llm
         self.tools = tools
         self.policy = policy
-        self.limits = limits
-        self.recorder = recorder
         self.settings = settings
+        self.recorder = recorder
         self.logger = logging.getLogger(__name__)
 
         # 上下文构建器
-        self.context_builder = AgentContextBuilder(ContextConfig())
+        self.context_builder = AgentPromptBuilder(ContextConfig())
 
     async def run(self, context: AgentContext) -> AgentResult:
         """
@@ -77,21 +65,13 @@ class ReActRuntime:
             Agent 结果
         """
         # 创建预算
-        budget = AgentRunBudget.create(self.settings) if self.settings else None
+        budget = AgentRunBudget.create(self.settings)
 
         # 记录开始时间
         started_at = time.monotonic()
 
         try:
-            # 使用预算管理运行
-            if budget:
-                result = await self._run_with_budget(context, budget)
-            else:
-                # 兼容旧逻辑
-                result = await asyncio.wait_for(
-                    self._run_legacy(context),
-                    timeout=self.limits.timeout_seconds,
-                )
+            result = await self._run_with_budget(context, budget)
 
             # 记录总耗时
             duration_ms = int((time.monotonic() - started_at) * 1000)
@@ -118,8 +98,8 @@ class ReActRuntime:
             return AgentResult(
                 status="failed",
                 response=self._format_timeout_response(budget),
-                step_count=budget.steps if budget else 0,
-                tool_call_count=budget.tool_calls if budget else 0,
+                step_count=budget.steps,
+                tool_call_count=budget.tool_calls,
                 error_code="agent_timeout",
             )
 
@@ -136,8 +116,8 @@ class ReActRuntime:
             return AgentResult(
                 status="failed",
                 response=f"任务预算耗尽：{e}",
-                step_count=budget.steps if budget else 0,
-                tool_call_count=budget.tool_calls if budget else 0,
+                step_count=budget.steps,
+                tool_call_count=budget.tool_calls,
                 error_code="budget_exceeded",
             )
 
@@ -392,26 +372,40 @@ class ReActRuntime:
         user_text = context.user_text.lower()
 
         if any(kw in user_text for kw in ["计划", "规划", "安排", "待办", "todo"]):
-            capabilities.add("plans")
+            capabilities.add("plan")
+            capabilities.add("review")
 
         if any(kw in user_text for kw in ["文档", "记录", "document"]):
-            capabilities.add("documents")
+            capabilities.add("document_write")
 
-        if _needs_websearch(user_text):
-            capabilities.add("websearch")
+        if needs_websearch(user_text):
+            capabilities.add("search")
 
         if any(kw in user_text for kw in ["偏好", "设置", "preference"]):
             capabilities.add("preferences")
 
-        # 根据观察推断
+        # 根据观察推断：已执行的工具决定后续步骤可用的能力
         for obs in observations:
             tool = obs.get("tool", "")
-            if "plan" in tool:
-                capabilities.add("plans")
-            elif "document" in tool:
-                capabilities.add("documents")
-            elif "websearch" in tool:
-                capabilities.add("websearch")
+            if tool == "websearch.search":
+                # 搜索已执行，后续步骤可以读取完整结果
+                capabilities.add("search")
+                capabilities.add("tool_result")
+            elif tool == "tool_results.read":
+                capabilities.add("tool_result")
+            elif tool == "plans.save_draft":
+                capabilities.add("plan")
+                capabilities.add("review")
+            elif tool == "reviews.save":
+                capabilities.add("review")
+            elif tool == "attachments.analyze_image":
+                capabilities.add("image")
+            elif tool == "attachments.transcribe_audio":
+                capabilities.add("audio")
+            elif tool == "attachments.parse_document":
+                capabilities.add("document_parse")
+            elif tool in ("documents.prepare_create", "documents.prepare_append"):
+                capabilities.add("document_write")
 
         # 如果没有推断出任何能力，添加基础能力
         if not capabilities:
@@ -539,6 +533,7 @@ class ReActRuntime:
                 step_count=step_index + 1,
                 tool_call_count=budget.tool_calls,
                 error_code="" if result.status == "ok" else "terminal_tool_failed",
+                pending_action_ids=result.pending_action_ids,
             )
 
         # 添加观察
@@ -562,11 +557,8 @@ class ReActRuntime:
             error_code="budget_exceeded",
         )
 
-    def _format_timeout_response(self, budget: AgentRunBudget | None) -> str:
+    def _format_timeout_response(self, budget: AgentRunBudget) -> str:
         """格式化超时响应"""
-        if not budget:
-            return "处理超时，请缩小任务范围后重试。"
-
         parts = ["这次模型响应时间过长，任务尚未完成。", ""]
 
         # 已完成部分
@@ -594,168 +586,10 @@ class ReActRuntime:
 
         return "\n".join(parts)
 
-    async def _run_legacy(self, context: AgentContext) -> AgentResult:
-        """兼容旧的运行逻辑"""
-        observations: list[dict[str, str]] = []
-        seen_calls: set[str] = set()
-        tool_calls = 0
-        consecutive_errors = 0
-        for step_index in range(self.limits.max_steps):
-            decision = await self.llm.generate(
-                AgentDecision,
-                _system_prompt(self.tools),
-                _user_prompt(context, observations),
-            )
-            decision = _normalize_tool_decision(
-                context,
-                decision,
-                self.tools.schemas(),
-                observations,
-            )
-            if self.recorder is not None:
-                await self.recorder.record_decision(context, step_index, decision)
-            if decision.type == "final_answer":
-                if self.recorder is not None:
-                    await self.recorder.record_result(
-                        context,
-                        step_index,
-                        ToolResult(status="ok", summary="final_answer"),
-                    )
-                return AgentResult(
-                    status="completed",
-                    response=decision.content,
-                    step_count=step_index + 1,
-                    tool_call_count=tool_calls,
-                )
-            if decision.type == "ask_user":
-                if self.recorder is not None:
-                    await self.recorder.record_result(
-                        context,
-                        step_index,
-                        ToolResult(status="ok", summary="ask_user"),
-                    )
-                return AgentResult(
-                    status="awaiting_user",
-                    response=decision.content,
-                    step_count=step_index + 1,
-                    tool_call_count=tool_calls,
-                )
-            tool_calls += 1
-            if tool_calls > self.limits.max_tool_calls:
-                return _failed(step_index + 1, tool_calls, "agent_tool_limit_exceeded")
-            fingerprint = _call_fingerprint(decision.tool_name, decision.arguments)
-            if fingerprint in seen_calls:
-                return _failed(step_index + 1, tool_calls, "repeated_tool_call")
-            seen_calls.add(fingerprint)
-            tool = self.tools.get(decision.tool_name)
-            if tool is None:
-                result = ToolResult(status="denied", summary="工具不存在或不可见")
-            else:
-                policy = self.policy.evaluate(context, tool)
-                if policy.result == "BLOCK":
-                    result = ToolResult(status="denied", summary=policy.reason)
-                else:
-                    try:
-                        result = await self.tools.execute(
-                            decision.tool_name,
-                            decision.arguments,
-                            context,
-                        )
-                    except Exception:
-                        result = ToolResult(status="error", summary="工具执行失败")
-            if result.terminal:
-                if self.recorder is not None:
-                    await self.recorder.record_result(context, step_index, result)
-                return AgentResult(
-                    status="completed" if result.status == "ok" else "failed",
-                    response=result.response,
-                    step_count=step_index + 1,
-                    tool_call_count=tool_calls,
-                    error_code="" if result.status == "ok" else "terminal_tool_failed",
-                )
-            observations.append(
-                {
-                    "tool": decision.tool_name,
-                    "status": result.status,
-                    "summary": result.summary,
-                }
-            )
-            if self.recorder is not None:
-                await self.recorder.record_result(context, step_index, result)
-            consecutive_errors = consecutive_errors + 1 if result.status == "error" else 0
-            if consecutive_errors >= self.limits.max_consecutive_tool_errors:
-                return _failed(step_index + 1, tool_calls, "consecutive_tool_errors")
-        return _failed(self.limits.max_steps, tool_calls, "agent_step_limit_exceeded")
-
-
-def _system_prompt(registry: ToolRegistry) -> str:
-    return "\n".join(
-        (
-            "你是宋管家的 ReAct 决策器。只输出 JSON，不输出隐藏推理。",
-            "每一步只能选择 final_answer、ask_user 或 tool_call。",
-            "",
-            "## 重要优化原则",
-            "1. **优先使用 final_answer**：对于简单问题、问候、说明、状态查询，直接回答，不要调用工具。",
-            "2. **避免不必要的工具调用**：只有在需要真实操作时才调用工具。",
-            "3. **一次性完成**：调用工具时必须在本次 decision 的 arguments 中"
-            "一次性给出工具 schema 要求的完整参数。",
-            "4. **信息不足时 ask_user**：不要猜测或虚构参数。",
-            "",
-            "## 工具使用规则",
-            "- 外部写入只能调用 prepare 工具；commit 工具不可见，也不得猜测。",
-            "- 计划、复盘和文档正文都由本次 decision 生成；工具不会再次调用模型补全。",
-            "- 普通问候、说明和无需工具的问题直接使用 final_answer，不调用工具。",
-            "",
-            "## 能力说明",
-            "- 你可以识别图片：当用户发送图片时，使用 attachments.analyze_image 工具分析图片内容",
-            "- 你可以转写语音：当用户发送语音时，使用 attachments.transcribe_audio 工具转写",
-            "- 你可以解析文档：当用户发送文档时，使用 attachments.parse_document 工具解析",
-            "",
-            "## 业务规则",
-            "- 计划只拆分用户明确提到的事项：A=关键必做，B=重要，C=辅助生活；",
-            "  未明确时间必须为 null，相对时间依据 current_time，周期词映射 repeat。",
-            "- 复盘只能依据明确反馈；today_tasks 中未提到的任务标记 unconfirmed。",
-            "- 文档不得虚构事实、数据、人物或引用；信息不足时明确标记待补充。",
-            "",
-            "可用工具：",
-            json.dumps(registry.schemas(), ensure_ascii=False, separators=(",", ":")),
-            "",
-            '格式：{"type":"tool_call","tool_name":"...","arguments":{},'
-            '"content":"","decision_summary":"..."}',
-        )
-    )
-
-
-def _user_prompt(
-    context: AgentContext,
-    observations: list[dict[str, str]],
-) -> str:
-    return json.dumps(
-        {
-            "user_message": context.user_text,
-            "conversation": context.conversation_key,
-            "state_summary": context.metadata.get("state_summary", ""),
-            "current_time": context.metadata.get("current_time", ""),
-            "today_tasks": context.metadata.get("today_tasks", []),
-            "observations": observations,
-        },
-        ensure_ascii=False,
-    )
-
 
 def _call_fingerprint(tool_name: str, arguments: dict) -> str:
     canonical = json.dumps(arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(f"{tool_name}:{canonical}".encode()).hexdigest()
-
-
-def _failed(step_count: int, tool_calls: int, code: str) -> AgentResult:
-    return AgentResult(
-        status="failed",
-        response="当前任务未能安全完成，请调整要求后重试。",
-        step_count=step_count,
-        tool_call_count=tool_calls,
-        error_code=code,
-    )
 
 
 def _normalize_tool_decision(
@@ -772,7 +606,7 @@ def _normalize_tool_decision(
     if (
         decision.type == "final_answer"
         and "websearch.search" in visible_tools
-        and _needs_websearch(context.user_text)
+        and needs_websearch(context.user_text)
         and not search_already_ran
     ):
         return _websearch_decision(context, decision.arguments)
@@ -782,7 +616,7 @@ def _normalize_tool_decision(
         return decision
     if (
         "websearch.search" in visible_tools
-        and _needs_websearch(context.user_text)
+        and needs_websearch(context.user_text)
     ):
         return _websearch_decision(context, decision.arguments)
     if decision.tool_name.startswith("attachments."):
@@ -794,31 +628,6 @@ def _normalize_tool_decision(
         content=content,
         decision_summary=f"阻止调用不可见工具 {decision.tool_name}",
     )
-
-
-def _needs_websearch(text: str) -> bool:
-    terms = (
-        "搜索",
-        "查找",
-        "search",
-        "查询",
-        "检索",
-        "天气",
-        "气温",
-        "下雨",
-        "降雨",
-        "空气质量",
-        "weather",
-        "forecast",
-        "最新",
-        "新闻",
-        "资讯",
-        "recent",
-        "latest",
-        "news",
-    )
-    lowered = text.lower()
-    return any(term in lowered for term in terms)
 
 
 def _is_false_scope_refusal(decision: AgentDecision) -> bool:

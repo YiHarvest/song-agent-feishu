@@ -28,6 +28,8 @@ class ToolResult(BaseModel):
     summary: str = Field(max_length=2000)
     terminal: bool = False
     response: str = Field(default="", max_length=12000)
+    # prepare 类工具创建的待确认 Action ID；terminal 时由 Runtime 透传给 AgentResult
+    pending_action_ids: tuple[str, ...] = ()
 
 
 class AgentResult(BaseModel):
@@ -36,3 +38,5 @@ class AgentResult(BaseModel):
     step_count: int
     tool_call_count: int
     error_code: str = ""
+    # 由 terminal ToolResult 透传的待确认 Action ID，供适配层转 awaiting_confirmation
+    pending_action_ids: tuple[str, ...] = ()

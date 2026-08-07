@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -13,6 +14,7 @@ from pydantic import ValidationError
 from ..context.models import BusinessContext
 from ..domain.intents import ExtractedIntent, UserRequest
 from ..llm import LLMInvalidResponseError, StructuredLlm
+from ..observability.context import current_trace_id
 from .time_parser import current_time_context
 
 SYSTEM_PROMPT = """你是 Song Agent 的意图提取器。
@@ -80,6 +82,24 @@ class IntentExtractor:
         self.logger = logging.getLogger(__name__)
 
     async def extract(
+        self,
+        request: UserRequest,
+        business_context: BusinessContext | None = None,
+    ) -> ExtractedIntent:
+        started_at = time.monotonic()
+        result = await self._extract(request, business_context)
+        self.logger.info(
+            "perf intent_extraction trace_id=%s duration_ms=%d "
+            "intent=%s confidence=%s message_id=%s",
+            current_trace_id(),
+            int((time.monotonic() - started_at) * 1000),
+            result.intent,
+            result.confidence,
+            request.message_id,
+        )
+        return result
+
+    async def _extract(
         self,
         request: UserRequest,
         business_context: BusinessContext | None = None,

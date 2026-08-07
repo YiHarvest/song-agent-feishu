@@ -17,18 +17,21 @@ class ReminderApplicationService:
     def __init__(self, calendar: CalendarApplicationService) -> None:
         self.calendar = calendar
 
-    async def prepare_create(
-        self,
-        request: UserRequest,
-        arguments: dict,
-    ) -> ApplicationResult:
+    def _marked_arguments(self, arguments: dict) -> dict:
         arguments = dict(arguments)
         description = str(arguments.get("description") or "")
         arguments["description"] = f"{REMINDER_MARKER}\n{description}".strip()
         arguments.setdefault("reminder_minutes", [0])
-        return await self.calendar.prepare_create(
+        return arguments
+
+    async def create(
+        self,
+        request: UserRequest,
+        arguments: dict,
+    ) -> ApplicationResult:
+        return await self.calendar.create(
             request,
-            arguments,
+            self._marked_arguments(arguments),
             action_type="reminder.create",
         )
 
@@ -64,7 +67,7 @@ class ReminderApplicationService:
         result.message = "提醒查询完成。"
         return result
 
-    async def prepare_batch_create(
+    async def create_batch(
         self,
         request: UserRequest,
         arguments: dict,
@@ -92,23 +95,46 @@ class ReminderApplicationService:
                 intent="reminder.batch_create",
                 message=str(error),
             )
-        action_ids: list[str] = []
+        if any(item.get("attendee_open_ids") for item in items):
+            # 任一项带参与人 → 整批确认，不做混合执行
+            action_ids: list[str] = []
+            for index, item in enumerate(items):
+                item_request = request.model_copy(
+                    update={"message_id": f"{request.message_id}:reminder:{index}"}
+                )
+                result = await self.calendar.prepare_create_confirmation(
+                    item_request,
+                    self._marked_arguments(item),
+                    action_type="reminder.create",
+                )
+                if result.status != "awaiting_confirmation":
+                    return result.model_copy(
+                        update={"data": {**result.data, "action_ids": action_ids}}
+                    )
+                action_ids.append(result.action_id)
+            return ApplicationResult(
+                status="awaiting_confirmation",
+                intent="reminder.batch_create",
+                action_id=action_ids[0],
+                message=f"已准备 {len(action_ids)} 个提醒，等待逐一确认。",
+                data={"action_ids": action_ids},
+            )
+        created: list[dict] = []
         for index, item in enumerate(items):
             item_request = request.model_copy(
                 update={"message_id": f"{request.message_id}:reminder:{index}"}
             )
-            result = await self.prepare_create(item_request, item)
-            if result.status != "awaiting_confirmation":
+            result = await self.create(item_request, item)
+            if result.status != "ok":
                 return result.model_copy(
-                    update={"data": {**result.data, "action_ids": action_ids}}
+                    update={"data": {**result.data, "created": created}}
                 )
-            action_ids.append(result.action_id)
+            created.append(result.data)
         return ApplicationResult(
-            status="awaiting_confirmation",
+            status="ok",
             intent="reminder.batch_create",
-            action_id=action_ids[0],
-            message=f"已准备 {len(action_ids)} 个提醒，等待逐一确认。",
-            data={"action_ids": action_ids},
+            message=f"✅ 已创建 {len(created)} 条提醒",
+            data={"created": created},
         )
 
     async def prepare_cancel(

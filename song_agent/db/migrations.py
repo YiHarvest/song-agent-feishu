@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Awaitable, Callable
 
@@ -37,6 +38,8 @@ async def run_migrations(
         ("0010_context_memory", _context_memory),
         ("0011_attachments", _attachments),
         ("0012_agent_api", _agent_api),
+        ("0013_attachment_parse_results", _attachment_parse_results),
+        ("0014_retire_legacy_calendar_actions", _retire_legacy_calendar_actions),
     )
     for migration_id, migration in migrations:
         cursor = await db.execute(
@@ -723,3 +726,100 @@ def _encrypted(row: aiosqlite.Row, kind: str):
         nonce=row[f"{kind}_token_nonce"] or b"",
         key_version=row["encryption_key_version"],
     )
+
+
+async def _attachment_parse_results(
+    db: aiosqlite.Connection,
+    cipher: AesGcmTokenCipher,
+) -> None:
+    """0013: 附件解析结果缓存表（Q4b）。
+
+    缓存键 = (attachment_id, tool_name, instruction_hash, processor_version)。
+    附件删除时通过外键级联删除缓存映射；实际解析内容仍存 tool_results。
+    """
+
+    del cipher
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS attachment_parse_results (
+            id TEXT PRIMARY KEY,
+            attachment_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            instruction_hash TEXT NOT NULL,
+            processor_version TEXT NOT NULL,
+            result_ref TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            FOREIGN KEY (attachment_id) REFERENCES attachments(attachment_id) ON DELETE CASCADE,
+            UNIQUE (attachment_id, tool_name, instruction_hash, processor_version)
+        )
+        """
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_attachment_parse_results_expires "
+        "ON attachment_parse_results (expires_at)"
+    )
+
+
+async def _retire_legacy_calendar_actions(
+    db: aiosqlite.Connection,
+    cipher: AesGcmTokenCipher,
+) -> None:
+    """0014: 终止旧版 calendar.create + record_key 待处理动作（Q6）。
+
+    旧版“计划写日历”路径生成的 PendingAction 携带 record_key 载荷；
+    legacy executor fallback 移除后这些动作不再有可执行器。
+    必须一次性迁移到现有终态，避免 Outbox 无限重试：
+
+    - 等待确认 → expired（确认请求已失效，用户需重新发起）
+    - 已确认/已入队/可重试/未知远端状态 → failed_final（不可重试终态）
+    - 已完成/已取消/已过期/已终态 → 不动
+    幂等：重复执行只会命中尚未进入终态的行。
+    """
+
+    del cipher
+    now = int(time.time())
+    cursor = await db.execute(
+        "SELECT action_id, payload_json, status FROM pending_actions "
+        "WHERE action_type = 'calendar.create'"
+    )
+    rows = await cursor.fetchall()
+    targets: list[tuple[str, str]] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict) or "record_key" not in payload:
+            continue
+        status = row["status"]
+        if status == "awaiting_confirmation":
+            targets.append((row["action_id"], "expired"))
+        elif status in (
+            "confirmed",
+            "executing",
+            "failed_retryable",
+            "unknown_remote_state",
+        ):
+            targets.append((row["action_id"], "failed_final"))
+    for action_id, status in targets:
+        await db.execute(
+            """
+            UPDATE pending_actions
+            SET status = ?, consumed_at = ?,
+                last_error_code = 'legacy_executor_removed',
+                last_error_message = '旧版计划写日历执行器已移除，请重新发起操作',
+                updated_at = ?
+            WHERE action_id = ?
+            """,
+            (status, now, now, action_id),
+        )
+        await db.execute(
+            """
+            UPDATE action_outbox
+            SET status = 'cancelled', processed_at = ?,
+                claimed_by = NULL, claim_expires_at = NULL
+            WHERE action_id = ? AND status = 'pending'
+            """,
+            (now, action_id),
+        )

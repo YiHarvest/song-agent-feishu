@@ -53,11 +53,20 @@ class ConversationContextService:
             thread_id=context.thread_id,
         )
 
-    async def record_assistant(self, request: UserRequest, content: str) -> None:
+    async def record_assistant(
+        self,
+        request: UserRequest,
+        content: str,
+        *,
+        message_id: str = "",
+    ) -> None:
         context = self.builder.request_context(request)
+        final_id = message_id or (
+            f"assistant:{request.message_id or request.event_id or uuid.uuid4()}"
+        )
         await self.store.append_conversation_message(
             session_id=context.session_id,
-            message_id=f"assistant:{request.message_id or request.event_id or uuid.uuid4()}",
+            message_id=final_id,
             role="assistant",
             content=content,
             tenant_key=context.tenant_key,

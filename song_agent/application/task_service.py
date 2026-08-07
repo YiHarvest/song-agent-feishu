@@ -17,6 +17,7 @@ from ..domain.intents import UserRequest
 from ..domain.results import ApplicationResult
 from ..feishu.oauth import FeishuOAuth
 from ..feishu.openapi import FeishuApiError, FeishuOpenApi
+from ..modules.oauth.resume_models import resume_payload_json
 from ..services.pending_actions import PendingActionService
 from .calendar_service import _incoming_message
 
@@ -156,7 +157,7 @@ class TaskApplicationService:
             request.identity,
             request.chat_id,
             (scope,),
-            original_request=request.text,
+            original_request=resume_payload_json(request),
         )
         return ApplicationResult(
             status="authorization_required",

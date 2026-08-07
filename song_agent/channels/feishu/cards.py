@@ -1,10 +1,14 @@
-"""飞书卡片 JSON 2.0。"""
+"""飞书卡片 JSON 2.0 模板（纯构造函数，无副作用）。
+
+只依赖 `PendingAction` 领域对象；卡片 action value 仅携带
+`action_name` + `action_id`，绝不携带 payload / token / 正文。
+"""
 
 from __future__ import annotations
 
 from typing import Any
 
-from ..models import PendingAction
+from ...models import PendingAction
 
 
 def calendar_confirmation_card(markdown: str, action: PendingAction) -> dict[str, Any]:

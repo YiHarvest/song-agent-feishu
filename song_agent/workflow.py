@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -106,7 +105,6 @@ class AgentWorkflow:
         self.command_router = command_router
         self.logger = logging.getLogger(__name__)
         self._locks: dict[str, asyncio.Lock] = {}
-        self.notify_outbox: Callable[[], None] = lambda: None
         self.dispatcher: ApplicationDispatcher | None = None
         self.tools = self._build_tool_registry()
         settings = self.oauth.settings
@@ -290,10 +288,6 @@ class AgentWorkflow:
 
         if self.dispatcher is None:
             raise RuntimeError("ApplicationDispatcher 尚未配置")
-        await self.transport.send_markdown(
-            message.chat_id,
-            "⏳ 正在处理你的请求，请稍候…",
-        )
         result = await self.dispatcher.dispatch(
             UserRequest(
                 identity=message.identity(self.oauth.settings.feishu_app_id),

@@ -141,7 +141,7 @@ def workflow() -> AgentWorkflow:
 
 
 @pytest.mark.asyncio
-async def test_general_request_logs_content_and_sends_processing_status(caplog) -> None:
+async def test_general_request_logs_content_and_sends_single_result(caplog) -> None:
     instance = workflow()
 
     with caplog.at_level(logging.INFO, logger="test.workflow.messages"):
@@ -149,7 +149,6 @@ async def test_general_request_logs_content_and_sends_processing_status(caplog) 
 
     assert "content='杭州萧山天气怎么样'" in caplog.text
     assert instance.transport.messages == [
-        ("chat-1", "⏳ 正在处理你的请求，请稍候…"),
         ("chat-1", "处理完成"),
     ]
 

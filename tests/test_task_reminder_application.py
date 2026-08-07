@@ -9,6 +9,7 @@ from song_agent.application.reminder_service import REMINDER_MARKER, ReminderApp
 from song_agent.application.task_service import TaskApplicationService
 from song_agent.domain.intents import UserRequest
 from song_agent.models import FeishuIdentity
+from song_agent.services.audit import AuditService
 from song_agent.services.encryption import AesGcmTokenCipher
 from song_agent.services.pending_actions import PendingActionService
 from song_agent.store import SqliteStore
@@ -23,6 +24,18 @@ class OAuth:
 
 
 class OpenApi:
+    def __init__(self) -> None:
+        self.created: list[tuple] = []
+
+    async def create_calendar_command(self, command, token, *, idempotency_key):
+        self.created.append((command, token, idempotency_key))
+        return {
+            "event_id": f"event-{len(self.created)}",
+            "calendar_id": "cal-1",
+            "url": "",
+            "request_id": "req-1",
+        }
+
     async def query_tasks(self, command, token):
         return {"items": [{"guid": "task-1", "summary": "测试"}]}
 
@@ -103,34 +116,54 @@ async def test_task_crud_prepares_pending_actions_and_queries_feishu(
         await store.close()
 
 
+def make_reminder_service(
+    store: SqliteStore,
+    openapi: OpenApi,
+) -> ReminderApplicationService:
+    calendar = CalendarApplicationService(
+        OAuth(),
+        PendingActionService(store),
+        openapi,
+        default_timezone="Asia/Shanghai",
+        audit=AuditService(store),
+    )
+    return ReminderApplicationService(calendar)
+
+
 @pytest.mark.asyncio
-async def test_reminder_uses_marked_calendar_actions(tmp_path: Path) -> None:
+async def test_reminder_create_direct_marks_and_queries(tmp_path: Path) -> None:
     store = await make_store(tmp_path)
+    openapi = OpenApi()
     try:
-        calendar = CalendarApplicationService(
-            OAuth(),
-            PendingActionService(store),
-            OpenApi(),
-            default_timezone="Asia/Shanghai",
-        )
-        service = ReminderApplicationService(calendar)
+        service = make_reminder_service(store, openapi)
         start = datetime.now(UTC) + timedelta(hours=1)
-        created = await service.prepare_create(
+        created = await service.create(
             request(),
             {"summary": "喝水", "start_time": start.isoformat()},
         )
-        action = await store.get_pending_action(created.action_id)
         queried = await service.query(request(), {})
         cancelled = await service.prepare_cancel(
             request().model_copy(update={"message_id": "cancel"}),
             {"event_id": "event-1"},
         )
 
-        assert action and action.action_type == "reminder.create"
-        assert REMINDER_MARKER in action.payload["description"]
-        assert action.payload["reminder_minutes"] == [0]
+        assert created.status == "ok"
+        assert "已创建提醒" in created.message
+        assert len(openapi.created) == 1
+        command = openapi.created[0][0]
+        assert REMINDER_MARKER in command.description
+        assert command.reminder_minutes == [0]
         assert [item["event_id"] for item in queried.data["items"]] == ["event-1"]
         assert cancelled.intent == "reminder.cancel"
+        remaining = await store.list_pending_actions(
+            tenant_key="tenant",
+            app_id="app",
+            principal_id="union-a",
+        )
+        assert all(
+            action.action_type != "reminder.create"
+            for action in remaining
+        ), "普通提醒创建不得产生 PendingAction"
     finally:
         await store.close()
 
@@ -138,15 +171,10 @@ async def test_reminder_uses_marked_calendar_actions(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_reminder_accepts_single_integer_reminder_minutes(tmp_path: Path) -> None:
     store = await make_store(tmp_path)
+    openapi = OpenApi()
     try:
-        calendar = CalendarApplicationService(
-            OAuth(),
-            PendingActionService(store),
-            OpenApi(),
-            default_timezone="Asia/Shanghai",
-        )
-        service = ReminderApplicationService(calendar)
-        result = await service.prepare_create(
+        service = make_reminder_service(store, openapi)
+        result = await service.create(
             request(),
             {
                 "summary": "喝水",
@@ -154,27 +182,23 @@ async def test_reminder_accepts_single_integer_reminder_minutes(tmp_path: Path) 
                 "reminder_minutes": 0,
             },
         )
-        action = await store.get_pending_action(result.action_id)
-
-        assert result.status == "awaiting_confirmation"
-        assert action and action.payload["reminder_minutes"] == [0]
+        assert result.status == "ok"
+        command = openapi.created[0][0]
+        assert command.reminder_minutes == [0]
     finally:
         await store.close()
 
 
 @pytest.mark.asyncio
-async def test_reminder_repairs_equal_start_and_end_to_one_minute(tmp_path: Path) -> None:
+async def test_reminder_repairs_equal_start_and_end_to_one_minute(
+    tmp_path: Path,
+) -> None:
     store = await make_store(tmp_path)
+    openapi = OpenApi()
     try:
-        calendar = CalendarApplicationService(
-            OAuth(),
-            PendingActionService(store),
-            OpenApi(),
-            default_timezone="Asia/Shanghai",
-        )
-        service = ReminderApplicationService(calendar)
+        service = make_reminder_service(store, openapi)
         start = datetime.now(UTC) + timedelta(minutes=10)
-        result = await service.prepare_create(
+        result = await service.create(
             request(),
             {
                 "summary": "喝水",
@@ -183,30 +207,21 @@ async def test_reminder_repairs_equal_start_and_end_to_one_minute(tmp_path: Path
                 "reminder_minutes": 0,
             },
         )
-        action = await store.get_pending_action(result.action_id)
-
-        assert result.status == "awaiting_confirmation"
-        assert action
-        normalized_start = datetime.fromisoformat(action.payload["start_time"])
-        normalized_end = datetime.fromisoformat(action.payload["end_time"])
-        assert normalized_end - normalized_start == timedelta(minutes=1)
+        assert result.status == "ok"
+        command = openapi.created[0][0]
+        assert command.end_time - command.start_time == timedelta(minutes=1)
     finally:
         await store.close()
 
 
 @pytest.mark.asyncio
-async def test_batch_reminders_prepare_independent_actions(tmp_path: Path) -> None:
+async def test_batch_reminders_direct_create_all(tmp_path: Path) -> None:
     store = await make_store(tmp_path)
+    openapi = OpenApi()
     try:
-        calendar = CalendarApplicationService(
-            OAuth(),
-            PendingActionService(store),
-            OpenApi(),
-            default_timezone="Asia/Shanghai",
-        )
-        service = ReminderApplicationService(calendar)
+        service = make_reminder_service(store, openapi)
         tomorrow = datetime.now(UTC) + timedelta(days=1)
-        result = await service.prepare_batch_create(
+        result = await service.create_batch(
             request(),
             {
                 "items": [
@@ -220,16 +235,52 @@ async def test_batch_reminders_prepare_independent_actions(tmp_path: Path) -> No
             },
         )
 
+        assert result.status == "ok"
+        assert "2" in result.message
+        assert len(openapi.created) == 2
+        commands = [call[0] for call in openapi.created]
+        assert [command.summary for command in commands] == ["起床", "复盘"]
+        assert commands[1].recurrence == "FREQ=DAILY"
+        assert await store.list_pending_actions(
+            tenant_key="tenant",
+            app_id="app",
+            principal_id="union-a",
+        ) == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_batch_reminders_with_attendee_goes_confirmation(tmp_path: Path) -> None:
+    store = await make_store(tmp_path)
+    openapi = OpenApi()
+    try:
+        service = make_reminder_service(store, openapi)
+        tomorrow = datetime.now(UTC) + timedelta(days=1)
+        result = await service.create_batch(
+            request(),
+            {
+                "items": [
+                    {"summary": "起床", "start_time": tomorrow.isoformat()},
+                    {
+                        "summary": "复盘",
+                        "start_time": (tomorrow + timedelta(hours=1)).isoformat(),
+                        "attendee_open_ids": ["open-x"],
+                    },
+                ]
+            },
+        )
+
         assert result.status == "awaiting_confirmation"
+        assert openapi.created == []
         assert len(result.data["action_ids"]) == 2
         actions = [
             await store.get_pending_action(action_id)
             for action_id in result.data["action_ids"]
         ]
-        assert [action.payload["summary"] for action in actions if action] == [
-            "起床",
-            "复盘",
+        assert [action.action_type for action in actions if action] == [
+            "reminder.create",
+            "reminder.create",
         ]
-        assert actions[1] and actions[1].payload["recurrence"] == "FREQ=DAILY"
     finally:
         await store.close()

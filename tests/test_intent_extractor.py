@@ -4,7 +4,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from song_agent.application.request_router import RequestRouter
+from song_agent.application.dispatcher import ApplicationDispatcher
 from song_agent.domain.intents import ExtractedIntent, UserRequest
 from song_agent.intelligence.intent_extractor import (
     IntentExtractor,
@@ -344,17 +344,14 @@ async def test_low_confidence_does_not_dispatch_external_operation() -> None:
             return object()
 
     calendar = Calendar()
-    router = RequestRouter(
+    dispatcher = ApplicationDispatcher(
         Extractor(),
-        calendar,
-        object(),
-        object(),
-        object(),
         General(),
         BusinessContexts(),
         Contexts(),
         object(),
     )
-    result = await router.handle(request())
+    dispatcher.register("calendar.create", calendar.prepare_create)
+    result = await dispatcher.dispatch(request())
     assert result.status == "clarification_required"
     assert calendar.called is False

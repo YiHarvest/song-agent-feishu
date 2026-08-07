@@ -44,13 +44,13 @@ async def list_reminders(
     )
 
 
-@router.post("/prepare")
-async def prepare_create(
+@router.post("")
+async def create_reminder(
     body: ReminderCreateRequest,
     request: Request,
     identity: Annotated[FeishuIdentity, Depends(current_identity)],
 ) -> ApplicationResult:
-    return await request.app.state.reminder_service.prepare_create(
+    return await request.app.state.reminder_service.create(
         user_request(identity, body, text=body.summary),
         body.model_dump(exclude={"request_id", "chat_id", "thread_id"}),
     )

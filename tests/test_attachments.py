@@ -15,8 +15,8 @@ from pydantic import ValidationError
 
 from song_agent.api.agent_auth import ApiCredential
 from song_agent.app import create_app
-from song_agent.application.request_router import (
-    RequestRouter,
+from song_agent.application.dispatcher import (
+    ApplicationDispatcher,
     _resolve_document_context,
     _resolve_reference_context,
 )
@@ -828,7 +828,7 @@ async def test_attachment_service_recovers_interrupted_rows_on_startup(
 
 
 @pytest.mark.asyncio
-async def test_request_router_preserves_attachment_retrieved_context() -> None:
+async def test_dispatcher_preserves_attachment_retrieved_context() -> None:
     captured: list[UserRequest] = []
 
     class Extractor:
@@ -855,18 +855,14 @@ async def test_request_router_preserves_attachment_retrieved_context() -> None:
             captured.append(request)
             return ApplicationResult(status="ok", message="ok")
 
-    router = RequestRouter(
+    dispatcher = ApplicationDispatcher(
         Extractor(),  # type: ignore[arg-type]
-        object(),  # type: ignore[arg-type]
-        object(),  # type: ignore[arg-type]
-        object(),  # type: ignore[arg-type]
-        object(),  # type: ignore[arg-type]
         General(),  # type: ignore[arg-type]
         Business(),  # type: ignore[arg-type]
         Conversations(),  # type: ignore[arg-type]
         AgentInputs(),  # type: ignore[arg-type]
     )
-    await router.handle(
+    await dispatcher.dispatch(
         UserRequest(
             identity=FeishuIdentity(app_id="app", open_id="user"),
             text="分析附件",
@@ -900,9 +896,9 @@ def test_document_reference_skips_failed_and_repeated_commands() -> None:
         current,
         {"role": "assistant", "content": "需要记录的原句。"},
     ) == {
-        "action": "append",
+        "action": "create",
         "title": None,
-        "target_title": "每日记录",
+        "target_title": None,
         "markdown": "需要记录的原句。",
     }
 

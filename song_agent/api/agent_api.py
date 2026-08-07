@@ -62,7 +62,7 @@ async def retrieve_model(
     summary="创建聊天补全",
     description=(
         "OpenAI Chat Completions 兼容入口。请求会转换为 Song Agent `UserRequest`，"
-        "复用现有 `RequestRouter`。支持普通 JSON 和 `stream=true` SSE 响应。"
+        "复用现有 `ApplicationDispatcher`。支持普通 JSON 和 `stream=true` SSE 响应。"
         "当前只支持文本，`n` 只能为 1，不支持 tools、tool_choice 和 tool role。"
     ),
     response_description="OpenAI Chat Completion 或 SSE 数据流。",

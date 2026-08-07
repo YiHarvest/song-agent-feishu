@@ -15,7 +15,7 @@ from .dependencies import ApiRequestMeta, current_identity, user_request
 router = APIRouter(prefix="/api/calendar/events", tags=["calendar"])
 
 
-class CalendarPrepareRequest(ApiRequestMeta):
+class CalendarCreateRequest(ApiRequestMeta):
     summary: str = Field(min_length=1)
     start_time: str
     end_time: str | None = None
@@ -72,14 +72,14 @@ async def list_events(
     )
 
 
-@router.post("/prepare")
-async def prepare_create(
-    body: CalendarPrepareRequest,
+@router.post("")
+async def create_event(
+    body: CalendarCreateRequest,
     request: Request,
     identity: Annotated[FeishuIdentity, Depends(current_identity)],
 ) -> ApplicationResult:
     payload = body.model_dump(exclude={"request_id", "chat_id", "thread_id"})
-    return await request.app.state.calendar_service.prepare_create(
+    return await request.app.state.calendar_service.create(
         user_request(identity, body, text=body.summary),
         payload,
     )

@@ -226,6 +226,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             pending_actions,
             openapi,
             default_timezone=config.timezone,
+            audit=audit,
         )
         task_service = TaskApplicationService(oauth, pending_actions, openapi)
         reminder_service = ReminderApplicationService(calendar_service)
@@ -246,7 +247,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             conversation_contexts,
             agent_inputs,
         )
-        dispatcher.register("calendar.create", calendar_service.prepare_create)
+        dispatcher.register("calendar.create", calendar_service.create)
         dispatcher.register("calendar.query", calendar_service.query)
         dispatcher.register("calendar.update", calendar_service.prepare_update)
         dispatcher.register("calendar.delete", calendar_service.prepare_delete)
@@ -255,8 +256,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         dispatcher.register("task.update", task_service.prepare_update)
         dispatcher.register("task.complete", task_service.prepare_complete)
         dispatcher.register("task.delete", task_service.prepare_delete)
-        dispatcher.register("reminder.create", reminder_service.prepare_create)
-        dispatcher.register("reminder.batch_create", reminder_service.prepare_batch_create)
+        dispatcher.register("reminder.create", reminder_service.create)
+        dispatcher.register("reminder.batch_create", reminder_service.create_batch)
         dispatcher.register("reminder.query", reminder_service.query)
         dispatcher.register("reminder.cancel", reminder_service.prepare_cancel)
         workflow.set_dispatcher(dispatcher)
@@ -301,9 +302,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             executors.execute,
             reconciliation.reconcile,
         )
-        workflow.notify_outbox = outbox.notify
         pending_action_service.set_outbox_notifier(outbox.notify)
-        
         oauth_resume = OAuthResumeService(
             dispatcher,
             presenter,

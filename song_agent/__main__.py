@@ -1,27 +1,39 @@
-"""
-Song Agent 入口点。
-
-启动 FastAPI 服务，监听飞书 WebSocket 长连接消息。
-"""
+from __future__ import annotations
 
 import argparse
+import os
+from pathlib import Path
 
 import uvicorn
-
-from .config import Settings
+from alembic import command
+from alembic.config import Config
 
 
 def main() -> None:
-    """启动 Song Agent 服务。"""
-    parser = argparse.ArgumentParser(description="启动 Song Agent")
-    parser.add_argument("--reload", action="store_true", help="代码变更后自动重启（仅用于开发环境）")
+    parser = argparse.ArgumentParser(prog="song-agent")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    serve = subparsers.add_parser("serve", help="start the HTTP service")
+    serve.add_argument("--host", default="0.0.0.0")
+    serve.add_argument("--port", type=int, default=int(os.getenv("SONG_AGENT_PORT", "45837")))
+    serve.add_argument("--reload", action="store_true")
+    migrate = subparsers.add_parser("migrate", help="explicitly upgrade the database schema")
+    migrate.add_argument(
+        "--database",
+        type=Path,
+        default=Path(os.getenv("SONG_AGENT_DATABASE_PATH", ".data/song-agent-v1.db")),
+    )
     args = parser.parse_args()
-    settings = Settings()
+    if args.command == "migrate":
+        args.database.parent.mkdir(parents=True, exist_ok=True)
+        os.environ["SONG_AGENT_DATABASE_PATH"] = str(args.database)
+        config = Config("alembic.ini")
+        command.upgrade(config, "head")
+        args.database.chmod(0o600)
+        return
     uvicorn.run(
         "song_agent.app:app",
-        host="0.0.0.0",
-        port=settings.port,
-        log_level=settings.log_level.lower(),
+        host=args.host,
+        port=args.port,
         reload=args.reload,
         reload_dirs=["song_agent"] if args.reload else None,
     )

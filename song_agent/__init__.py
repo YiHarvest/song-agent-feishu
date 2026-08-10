@@ -1,10 +1,3 @@
-"""
-Song Agent - 飞书多用户个人管家
+"""Song Agent modular intent framework."""
 
-基于 Python + FastAPI 实现的飞书自建 Agent，支持：
-- 自然语言交互，自动识别意图
-- 多用户隔离的计划、提醒、复盘管理
-- 飞书日历与云文档操作
-"""
-
-__version__ = "0.3.0"
+__version__ = "1.0.0"

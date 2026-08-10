@@ -1,1 +1,1 @@
-"""每日计划模块。"""
+"""Built-in capability modules."""

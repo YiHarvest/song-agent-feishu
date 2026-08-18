@@ -46,6 +46,16 @@ class ChatCompletionBody(BaseModel):
 def api_router() -> APIRouter:
     router = APIRouter()
 
+    @router.get("/")
+    async def root() -> dict[str, str]:
+        """Root endpoint - basic service info."""
+        return {
+            "name": "Song Agent",
+            "status": "running",
+            "docs": "/docs",
+            "health": "/health",
+        }
+
     @router.get("/health")
     async def health(request: Request) -> dict[str, Any]:
         runtime = _runtime(request)
@@ -220,22 +230,41 @@ def api_router() -> APIRouter:
 
     @router.post("/adapters/feishu/events", include_in_schema=False)
     async def feishu_events(request: Request) -> dict[str, Any]:
+        import logging
+        logger = logging.getLogger(__name__)
+
         adapter = _runtime(request).feishu_channel
         if adapter is None:
             raise HTTPException(status_code=404, detail="feishu_channel_disabled")
+
         raw_body = await request.body()
+        raw_body_str = raw_body.decode('utf-8', errors='replace')
+
+        # 详细日志
+        logger.warning(f"=== Feishu request received ===")
+        logger.warning(f"Headers:")
+        for key, value in request.headers.items():
+            logger.warning(f"  {key}: {value}")
+        logger.warning(f"Body length: {len(raw_body)}")
+        logger.warning(f"Body: {raw_body_str}")
+
         try:
             payload = json.loads(raw_body)
             if not isinstance(payload, dict):
                 raise ValueError("event body must be an object")
-            return await adapter.handle(
+
+            result = await adapter.handle(
                 payload,
                 raw_body=raw_body,
                 headers={key.lower(): value for key, value in request.headers.items()},
             )
+            logger.warning(f"Response: {result}")
+            return result
         except PermissionError as error:
+            logger.error(f"PermissionError: {error}")
             raise HTTPException(status_code=401, detail=str(error)) from error
         except (ValueError, json.JSONDecodeError) as error:
+            logger.error(f"ValueError/JSONDecodeError: {error}")
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     @router.get("/adapters/feishu/oauth/callback", include_in_schema=False)

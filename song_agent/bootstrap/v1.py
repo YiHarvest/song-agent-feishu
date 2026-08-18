@@ -138,8 +138,16 @@ class ApplicationRuntime:
     async def start(self) -> None:
         await self.database.verify_schema()
         await self.modules.start()
+        # Start WebSocket for Feishu messages if channel is enabled
+        if self.feishu_channel is not None:
+            import asyncio
+            loop = asyncio.get_running_loop()
+            self.feishu_channel.start_websocket(loop)
 
     async def close(self) -> None:
+        # Close WebSocket first
+        if self.feishu_channel is not None:
+            await self.feishu_channel.close_websocket()
         await self.modules.close()
         await self.model.close()
 

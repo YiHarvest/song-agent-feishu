@@ -61,6 +61,7 @@ v1 不兼容旧 Schema，也不导入旧 JSON。默认数据库是 `.data/song-a
 ```bash
 uv sync
 cp .env.example .env
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
 uv run song-agent migrate
 uv run song-agent serve --reload
 ```
